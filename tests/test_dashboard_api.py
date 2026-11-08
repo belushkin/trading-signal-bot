@@ -1,0 +1,265 @@
+from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+
+import pytest
+from httpx import ASGITransport, AsyncClient
+
+from stellar_intelligence_bot.app.config import Settings
+from stellar_intelligence_bot.app.dashboard_api import create_app
+from stellar_intelligence_bot.core.markets import MarketPair
+from stellar_intelligence_bot.storage.database import Database
+from stellar_intelligence_bot.storage.models import (
+    EventRecord,
+    MarketSnapshotRecord,
+    RuntimeHealthRecord,
+    SignalEvaluationRecord,
+    SignalRecord,
+)
+
+ISSUER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
+PAIR = f"native/USDC:{ISSUER}"
+TX_HASH = "a" * 64
+
+
+@asynccontextmanager
+async def _api(
+    database_path: str, settings: Settings
+) -> AsyncIterator[tuple[AsyncClient, Database]]:
+    database = Database(f"sqlite+aiosqlite:///{database_path}")
+    await database.initialize()
+    app = create_app(database=database, settings=settings)
+    try:
+        async with app.router.lifespan_context(app):
+            async with AsyncClient(
+                transport=ASGITransport(app=app), base_url="http://dashboard.test"
+            ) as client:
+                yield client, database
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
+async def test_empty_database_and_unconfigured_markets_are_explicit(tmp_path) -> None:
+    async with _api(str(tmp_path / "empty.db"), Settings()) as (client, _):
+        health = await client.get("/api/health")
+        overview = await client.get("/api/overview")
+        markets = await client.get("/api/markets")
+        signals = await client.get("/api/signals")
+        activity = await client.get("/api/activity")
+        analytics = await client.get("/api/analytics?days=7")
+
+    assert health.status_code == 200
+    assert health.json()["database"]["status"] == "healthy"
+    assert health.json()["collector"]["status"] == "not_started"
+    assert overview.json()["counts"] == {"events": 0, "signals": 0}
+    assert "no_markets_configured" in {item["code"] for item in overview.json()["warnings"]}
+    assert markets.json()["items"] == []
+    assert "No markets are configured" in markets.json()["message"]
+    assert signals.json()["items"] == []
+    assert activity.json()["items"] == []
+    assert analytics.json()["data_coverage"]["events"] == 0
+    assert analytics.json()["data_coverage"]["missing_observation_rate_percent"] is None
+    assert len(analytics.json()["signal_frequency"]) == 7
+    assert all(item["count"] == 0 for item in analytics.json()["signal_frequency"])
+
+
+@pytest.mark.asyncio
+async def test_started_collector_without_completed_cycle_is_starting(tmp_path) -> None:
+    async with _api(str(tmp_path / "starting.db"), Settings()) as (client, database):
+        await database.start_health(datetime.now(UTC))
+
+        health = (await client.get("/api/health")).json()
+        overview = (await client.get("/api/overview")).json()
+
+    assert health["collector"]["status"] == "starting"
+    assert overview["collector"]["status"] == "starting"
+    assert "collector_starting" in {item["code"] for item in overview["warnings"]}
+
+
+@pytest.mark.asyncio
+async def test_missing_market_observations_and_stale_persisted_data(tmp_path) -> None:
+    pair = MarketPair.parse(PAIR)
+    settings = Settings(monitored_pairs=(pair,))
+    async with _api(str(tmp_path / "stale.db"), settings) as (client, database):
+        missing = (await client.get("/api/markets")).json()["items"][0]
+        now = datetime.now(UTC)
+        old_time = now - timedelta(minutes=10)
+        async with database.sessions.begin() as session:
+            session.add(
+                MarketSnapshotRecord(
+                    pair_key=PAIR,
+                    observed_at=old_time,
+                    best_bid=Decimal("9"),
+                    best_ask=Decimal("11"),
+                    bid_depth=Decimal("100"),
+                    ask_depth=Decimal("120"),
+                    spread_percent=Decimal("18.18"),
+                    observed_facts={},
+                )
+            )
+            session.add(
+                RuntimeHealthRecord(
+                    health_key="collector",
+                    started_at=old_time,
+                    last_success_at=old_time,
+                    last_error_at=None,
+                    last_error=None,
+                )
+            )
+        stale = (await client.get("/api/markets")).json()["items"][0]
+        detail = await client.get(f"/api/markets/{PAIR}")
+        overview = (await client.get("/api/overview")).json()
+
+    assert missing["status"] == "no_data"
+    assert missing["latest_price"] is None
+    assert missing["volume_24h_base"] is None
+    assert stale["status"] == "stale"
+    assert Decimal(stale["latest_price"]) == Decimal("10")
+    assert detail.status_code == 200
+    assert Decimal(detail.json()["history"][0]["price"]) == Decimal("10")
+    assert overview["collector"]["status"] == "stale"
+    assert "collector_stale" in {item["code"] for item in overview["warnings"]}
+
+
+@pytest.mark.asyncio
+async def test_signal_filters_pagination_details_and_activity_links(tmp_path) -> None:
+    settings = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
+    async with _api(str(tmp_path / "signals.db"), settings) as (client, database):
+        now = datetime.now(UTC)
+        async with database.sessions.begin() as session:
+            for index in range(3):
+                event_id = f"payment:{index}"
+                signal_id = f"signal:{index}"
+                session.add(
+                    EventRecord(
+                        event_id=event_id,
+                        chain="stellar",
+                        event_type="payment",
+                        occurred_at=now - timedelta(minutes=index),
+                        source_ref=f"https://stellar.expert/explorer/public/tx/{TX_HASH}",
+                        attributes={"amount": "500", "asset": "native"},
+                    )
+                )
+                session.add(
+                    SignalRecord(
+                        signal_id=signal_id,
+                        deduplication_key=signal_id,
+                        event_id=event_id,
+                        occurred_at=now - timedelta(minutes=index),
+                        category="whale_transfer" if index == 2 else "wide_spread",
+                        severity="HIGH" if index == 2 else "WATCH",
+                        confidence="HIGH",
+                        observed_facts={"pair": PAIR, "asset": "native", "amount": str(index)},
+                        interpretation=f"Observed facts for test {index}",
+                        expires_at=now + timedelta(minutes=30),
+                    )
+                )
+                session.add(
+                    SignalEvaluationRecord(
+                        signal_id=signal_id,
+                        pair_key=PAIR,
+                        horizon_minutes=5,
+                        target_at=now + timedelta(minutes=5),
+                        reference_at=now - timedelta(minutes=index),
+                        reference_price=Decimal("10"),
+                        measured_price=None,
+                        measured_at=None,
+                        return_percent=None,
+                        max_increase_percent=None,
+                        max_decrease_percent=None,
+                        observation_count=0,
+                        largest_gap_seconds=None,
+                        status="missing_observation",
+                        data_quality="missing_observation",
+                        evaluated_at=now,
+                    )
+                )
+
+        page = await client.get(
+            "/api/signals",
+            params={"pair": PAIR, "category": "wide_spread", "severity": "WATCH", "limit": 1},
+        )
+        next_page = await client.get(
+            "/api/signals",
+            params={
+                "pair": PAIR,
+                "category": "wide_spread",
+                "severity": "WATCH",
+                "limit": 1,
+                "offset": 1,
+            },
+        )
+        by_asset = await client.get("/api/signals", params={"pair": "native", "limit": 10})
+        detail = await client.get("/api/signals/signal:0")
+        activity = await client.get("/api/activity", params={"event_type": "payment", "limit": 1})
+
+    assert page.status_code == 200
+    assert page.json()["total"] == 2
+    assert len(page.json()["items"]) == 1
+    assert page.json()["items"][0]["signal_id"] != next_page.json()["items"][0]["signal_id"]
+    assert by_asset.json()["total"] == 3
+    assert detail.json()["observed_facts"]["amount"] == "0"
+    assert detail.json()["evaluations"][0]["status"] == "missing_observation"
+    assert (
+        detail.json()["source"]["explorer_url"]
+        == f"https://stellar.expert/explorer/public/tx/{TX_HASH}"
+    )
+    assert activity.json()["items"][0]["event_type"] == "payment"
+    assert activity.json()["items"][0]["explorer_url"].endswith(TX_HASH)
+
+
+@pytest.mark.asyncio
+async def test_validation_and_not_found_errors_use_consistent_envelopes(tmp_path) -> None:
+    async with _api(str(tmp_path / "errors.db"), Settings()) as (client, _):
+        invalid = await client.get("/api/signals?limit=101")
+        missing = await client.get("/api/signals/does-not-exist")
+
+    assert invalid.status_code == 422
+    assert invalid.json()["error"]["code"] == "validation_error"
+    assert missing.status_code == 404
+    assert missing.json()["error"]["code"] == "not_found"
+
+
+@pytest.mark.asyncio
+async def test_signal_details_do_not_expose_internal_source_urls_or_query_credentials(
+    tmp_path,
+) -> None:
+    settings = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
+    async with _api(str(tmp_path / "source-url.db"), settings) as (client, database):
+        now = datetime.now(UTC)
+        internal_url = "https://horizon.invalid/order_book?api_key=fixture"
+        async with database.sessions.begin() as session:
+            session.add(
+                EventRecord(
+                    event_id="snapshot:private-source",
+                    chain="stellar",
+                    event_type="market_snapshot",
+                    occurred_at=now,
+                    source_ref=internal_url,
+                    attributes={},
+                )
+            )
+            session.add(
+                SignalRecord(
+                    signal_id="signal:private-source",
+                    deduplication_key="test",
+                    event_id="snapshot:private-source",
+                    occurred_at=now,
+                    category="wide_spread",
+                    severity="WATCH",
+                    confidence="HIGH",
+                    observed_facts={"pair": PAIR, "reference_source": internal_url},
+                    interpretation="A test signal.",
+                    expires_at=now + timedelta(minutes=30),
+                )
+            )
+        response = await client.get("/api/signals/signal:private-source")
+        serialized = response.text
+
+    assert response.status_code == 200
+    assert "fixture" not in serialized
+    assert response.json()["source"]["source_ref"] is None
+    assert response.json()["source"]["explorer_url"] is None
+    assert "reference_source" not in response.json()["observed_facts"]

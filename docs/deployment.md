@@ -1,6 +1,6 @@
 # Docker Compose deployment
 
-The Compose stack runs the read-only collector and PostgreSQL. It does not configure Discord, a wallet, transaction signing, or trade execution. A successful local Compose check does not imply deployment to a remote host.
+The Compose stack runs the read-only collector, dashboard API, React web UI, and PostgreSQL. The UI and API are read-only and use the collector's existing database. It does not configure Discord, a wallet, transaction signing, or trade execution. A successful local Compose check does not imply deployment to a remote host.
 
 ## Requirements
 
@@ -29,7 +29,19 @@ docker compose ps
 docker compose logs --tail=100 app
 ```
 
-The `app` waits for PostgreSQL's health check, applies Alembic migrations, then starts collecting. Both services restart unless stopped. The database is stored in the named `postgres_data` volume. No ports are published to the host. The app runs as an unprivileged user, has a 30-second graceful-shutdown window, and container logs rotate at 10 MB per file with three files retained.
+The dashboard is available at `http://127.0.0.1:8080` by default. `DASHBOARD_PORT` configures the host port, `DASHBOARD_BIND_ADDRESS` defaults to `127.0.0.1`, and `DASHBOARD_REFRESH_SECONDS` defaults to 20 (allowed range 5–300 seconds). Only the dashboard frontend publishes a host port; it proxies `/api/` requests to the private API service. Keep the default localhost binding unless access is restricted to a trusted private network by address and firewall. Authentication is intentionally not included.
+
+The `app` waits for PostgreSQL's health check, applies Alembic migrations, then starts collecting. The API waits for PostgreSQL and the web UI waits for the API process. The dashboard may briefly show an API/database error while collector migrations are starting; it retries on the configured polling interval. The database is stored in the existing named `postgres_data` volume. The collector and API run as unprivileged users; the API and web UI also drop Linux capabilities, use read-only root filesystems, and have health checks. The collector has a 30-second graceful-shutdown window. Container logs rotate at 10 MB per file with three files retained.
+
+Check dashboard health and collection status:
+
+```sh
+curl http://127.0.0.1:8080/api/health
+docker compose ps
+docker compose logs --tail=100 api dashboard
+```
+
+The API health response reports database availability, collector heartbeat freshness, and the configured refresh interval. Dashboard metrics use actual persisted events, signals, trades, order-book snapshots, and signal evaluations. Markets with no observations show N/A; stale snapshots are marked stale. Historical market-price charts show discrete midprice observation dots instead of connecting observations across gaps. The activity page links only to transaction hashes in the persisted StellarExpert source references.
 
 Check runtime status and signal evaluation reports:
 
@@ -42,10 +54,11 @@ The app's Docker health check tests the database connection and a successful col
 
 ## Configuration changes
 
-Edit `.env` and recreate the app after changing settings:
+Edit `.env` and recreate the relevant services after changing settings:
 
 ```sh
 docker compose up -d --force-recreate app
+docker compose up -d --force-recreate api dashboard
 ```
 
 Changing the PostgreSQL credentials for an already-initialized database requires a coordinated database credential update; changing `.env` alone does not rotate the role password stored in PostgreSQL.

@@ -30,6 +30,7 @@ json_type = JSON().with_variant(JSONB(), "postgresql").with_variant(SQLiteJSON()
 
 class EventRecord(Base):
     __tablename__ = "events"
+    __table_args__ = (Index("ix_events_type_time", "event_type", "occurred_at"),)
 
     event_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     chain: Mapped[str] = mapped_column(String(32), nullable=False, index=True)
@@ -41,7 +42,10 @@ class EventRecord(Base):
 
 class SignalRecord(Base):
     __tablename__ = "signals"
-    __table_args__ = (Index("ix_signals_dedupe_occurred", "deduplication_key", "occurred_at"),)
+    __table_args__ = (
+        Index("ix_signals_dedupe_occurred", "deduplication_key", "occurred_at"),
+        Index("ix_signals_time_category_severity", "occurred_at", "category", "severity"),
+    )
 
     signal_id: Mapped[str] = mapped_column(String(255), primary_key=True)
     deduplication_key: Mapped[str] = mapped_column(String(255), nullable=False)

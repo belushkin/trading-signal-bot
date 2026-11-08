@@ -6,7 +6,7 @@ A read-only, human-in-the-loop Stellar activity and market monitor. It does not 
 
 The service currently collects new ledger summaries and payment operations from public Stellar Horizon, plus trade history and order-book snapshots for configured pairs. It persists normalized events, trades, five-minute volume windows, market snapshots, signal history, and per-stream cursors. Signals cover configured large transfers, unusually high pair volume after a baseline is available, large visible orders, and wide spreads.
 
-Signal outcome evaluation, PostgreSQL deployment, health checks, and retention are also implemented. Discord notifications and control commands are intentionally omitted for now.
+Signal outcome evaluation, PostgreSQL deployment, health checks, retention, and a read-only web dashboard are implemented. The dashboard reads persisted collector data through a FastAPI API and does not connect directly to Stellar. Discord notifications and control commands are intentionally omitted for now.
 
 Large transfers are not interpreted as buys or sells. Visible offers can change or cancel and are not evidence of execution. This MVP does not reconstruct historical order books, collect every transaction body, monitor AMM pools, or deliver Discord notifications.
 
@@ -45,7 +45,7 @@ The process applies Alembic migrations on startup. To run or inspect migrations 
 
 ## Docker Compose
 
-The PostgreSQL Compose deployment, health checks, retention, backup/recovery steps, and operational limits are documented in [docs/deployment.md](docs/deployment.md).
+The PostgreSQL Compose deployment includes the collector, read-only dashboard API, and React dashboard. See [docs/deployment.md](docs/deployment.md) for dashboard access, health checks, retention, backup/recovery steps, and operational limits.
 
 ```sh
 cp .env.example .env
@@ -53,8 +53,11 @@ chmod 600 .env
 # Set POSTGRES_PASSWORD and desired monitoring settings in .env.
 docker compose up -d --build
 docker compose ps
+curl http://127.0.0.1:8080/api/health
 docker compose exec app python -m stellar_intelligence_bot health
 ```
+
+Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The dashboard binds to localhost by default and polls persisted data; configure `DASHBOARD_PORT` and `DASHBOARD_REFRESH_SECONDS` in `.env` as needed.
 
 Do not run `docker compose down -v` on a deployment with data you need; it removes the PostgreSQL volume.
 

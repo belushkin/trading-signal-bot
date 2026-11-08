@@ -13,8 +13,10 @@ dependencies = [
     "aiosqlite>=0.21,<1",
     "alembic>=1.15,<2",
     "asyncpg>=0.30,<1",
+    "fastapi>=0.115,<1",
     "SQLAlchemy[asyncio]>=2.0.40,<3",
     "stellar-sdk>=12.3,<14",
+    "uvicorn>=0.34,<1",
 ]
 
 [project.optional-dependencies]
@@ -23,6 +25,7 @@ dev = [
     "pytest>=8.3,<9",
     "pytest-asyncio>=0.26,<2",
     "ruff>=0.11,<1",
+    "httpx>=0.28,<1",
 ]
 
 [tool.setuptools.packages.find]
