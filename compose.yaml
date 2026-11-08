@@ -1,0 +1,61 @@
+services:
+  db:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-stellar}
+      POSTGRES_USER: ${POSTGRES_USER:-stellar}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "pg_isready -U \"$${POSTGRES_USER}\" -d \"$${POSTGRES_DB}\"",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 20s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  app:
+    build:
+      context: .
+    restart: unless-stopped
+    init: true
+    depends_on:
+      db:
+        condition: service_healthy
+    environment:
+      BOT_HORIZON_URL: ${BOT_HORIZON_URL:-https://horizon.stellar.org}
+      BOT_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER:-stellar}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB:-stellar}
+      BOT_MONITORED_PAIRS: ${BOT_MONITORED_PAIRS:-}
+      BOT_WHALE_THRESHOLDS: ${BOT_WHALE_THRESHOLDS:-}
+      BOT_POLL_INTERVAL_SECONDS: ${BOT_POLL_INTERVAL_SECONDS:-15}
+      BOT_VOLUME_BASELINE_SAMPLES: ${BOT_VOLUME_BASELINE_SAMPLES:-20}
+      BOT_VOLUME_ANOMALY_MULTIPLIER: ${BOT_VOLUME_ANOMALY_MULTIPLIER:-3}
+      BOT_LARGE_ORDER_THRESHOLD: ${BOT_LARGE_ORDER_THRESHOLD:-10000}
+      BOT_SPREAD_THRESHOLD_PERCENT: ${BOT_SPREAD_THRESHOLD_PERCENT:-1}
+      BOT_RETENTION_DAYS: ${BOT_RETENTION_DAYS:-90}
+      BOT_LOG_LEVEL: ${BOT_LOG_LEVEL:-INFO}
+    healthcheck:
+      test: ["CMD", "python", "-m", "stellar_intelligence_bot", "health"]
+      interval: 60s
+      timeout: 15s
+      retries: 3
+      start_period: 90s
+    stop_grace_period: 30s
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+volumes:
+  postgres_data:
