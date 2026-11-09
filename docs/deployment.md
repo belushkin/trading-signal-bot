@@ -29,6 +29,15 @@ docker compose ps
 docker compose logs --tail=100 app
 ```
 
+Alternatively, `./manage.sh start` builds and starts the same stack. Run
+`./manage.sh help` for all commands. `status` lists services, `logs [SERVICE]`
+follows the latest logs (interrupt with Ctrl+C), `health` checks the collector,
+`report` accepts the collector report options, and `config` validates the Compose
+configuration without printing its resolved secrets. `stop` preserves containers
+and database data. `restart` restarts existing containers without applying
+configuration changes; run `start` after editing `.env` to recreate services as
+needed. The script runs from the repository directory even when called elsewhere.
+
 The dashboard is available at `http://127.0.0.1:8080` by default. `DASHBOARD_PORT` configures the host port, `DASHBOARD_BIND_ADDRESS` defaults to `127.0.0.1`, and `DASHBOARD_REFRESH_SECONDS` defaults to 20 (allowed range 5–300 seconds). Only the dashboard frontend publishes a host port; it proxies `/api/` requests to the private API service. Keep the default localhost binding unless access is restricted to a trusted private network by address and firewall. Authentication is intentionally not included.
 
 The `app` waits for PostgreSQL's health check, applies Alembic migrations, then starts collecting. The API waits for PostgreSQL and the web UI waits for the API process. The dashboard may briefly show an API/database error while collector migrations are starting; it retries on the configured polling interval. The database is stored in the existing named `postgres_data` volume. The collector and API run as unprivileged users; the API and web UI also drop Linux capabilities, use read-only root filesystems, and have health checks. The collector has a 30-second graceful-shutdown window. Container logs rotate at 10 MB per file with three files retained.

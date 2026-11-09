@@ -59,6 +59,11 @@ docker compose exec app python -m stellar_intelligence_bot health
 
 Open [http://127.0.0.1:8080](http://127.0.0.1:8080). The dashboard binds to localhost by default and polls persisted data; configure `DASHBOARD_PORT` and `DASHBOARD_REFRESH_SECONDS` in `.env` as needed.
 
+For common operations, run `./manage.sh help`. For example, `./manage.sh start`
+builds and starts the stack, `./manage.sh status` shows service status,
+`./manage.sh logs app` follows collector logs, `./manage.sh health` checks the
+collector, and `./manage.sh stop` stops services without deleting data.
+
 Do not run `docker compose down -v` on a deployment with data you need; it removes the PostgreSQL volume.
 
 ## Validation
