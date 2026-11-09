@@ -178,8 +178,18 @@ class Database:
         base_amount: Decimal,
         quote_amount: Decimal,
     ) -> bool:
-        if base_amount <= 0 or quote_amount <= 0:
-            raise ValueError("Trade amounts must be positive")
+        if base_amount <= 0 or quote_amount < 0:
+            raise ValueError("Trade base amount must be positive and quote amount nonnegative")
+        if quote_amount == 0:
+            price = _optional_decimal(event.attributes.get("price"))
+            if (
+                price is None
+                or price <= 0
+                or event.attributes.get("price_source") != "horizon_rational"
+            ):
+                raise ValueError("Zero-quote trade requires a positive Horizon rational price")
+        else:
+            price = quote_amount / base_amount
         window_start = _five_minute_window(event.occurred_at)
         async with self.sessions.begin() as session:
             if await session.get(EventRecord, event.event_id) is not None:
@@ -193,7 +203,7 @@ class Database:
                     occurred_at=event.occurred_at,
                     base_amount=base_amount,
                     quote_amount=quote_amount,
-                    price=quote_amount / base_amount,
+                    price=price,
                     source_ref=event.source_ref,
                 )
             )
@@ -250,6 +260,7 @@ class Database:
             )
             pair_key = signal.observed_facts.get("pair")
             if isinstance(pair_key, str):
+                await session.flush()
                 reference = _optional_decimal(signal.observed_facts.get("reference_price"))
                 reference_source = signal.observed_facts.get("reference_source")
                 for horizon in EVALUATION_HORIZONS_MINUTES:
@@ -312,6 +323,57 @@ class Database:
                 )
             )
             return record.base_volume if record else Decimal(0)
+
+    async def book_observations(
+        self, pair: MarketPair, since: datetime, until: datetime
+    ) -> list[MarketSnapshotRecord]:
+        async with self.sessions() as session:
+            return list(
+                (
+                    await session.scalars(
+                        select(MarketSnapshotRecord)
+                        .where(
+                            MarketSnapshotRecord.pair_key == pair.key,
+                            MarketSnapshotRecord.observed_at >= since,
+                            MarketSnapshotRecord.observed_at <= until,
+                            MarketSnapshotRecord.best_bid > 0,
+                            MarketSnapshotRecord.best_ask >= MarketSnapshotRecord.best_bid,
+                        )
+                        .order_by(MarketSnapshotRecord.observed_at)
+                    )
+                ).all()
+            )
+
+    async def volume_windows(
+        self, pair: MarketPair, start: datetime, end: datetime
+    ) -> dict[datetime, Decimal]:
+        async with self.sessions() as session:
+            rows = (
+                await session.scalars(
+                    select(VolumeWindowRecord).where(
+                        VolumeWindowRecord.pair_key == pair.key,
+                        VolumeWindowRecord.window_start >= start,
+                        VolumeWindowRecord.window_start < end,
+                    )
+                )
+            ).all()
+        return {_as_utc(row.window_start): row.base_volume for row in rows}
+
+    async def trades_with_events(
+        self, pair: MarketPair, start: datetime, end: datetime
+    ) -> list[tuple[TradeRecord, EventRecord]]:
+        async with self.sessions() as session:
+            rows = await session.execute(
+                select(TradeRecord, EventRecord)
+                .join(EventRecord, EventRecord.event_id == TradeRecord.trade_id)
+                .where(
+                    TradeRecord.pair_key == pair.key,
+                    TradeRecord.occurred_at >= start,
+                    TradeRecord.occurred_at <= end,
+                )
+                .order_by(TradeRecord.occurred_at, TradeRecord.trade_id)
+            )
+            return [(trade, event) for trade, event in rows]
 
     async def save_market_snapshot(
         self,
@@ -452,6 +514,7 @@ class Database:
         *,
         since: datetime,
         horizon_minutes: int | None = None,
+        engine_version: str | None = None,
     ) -> list[dict[str, object]]:
         async with self.sessions() as session:
             query = (
@@ -464,6 +527,10 @@ class Database:
             )
             if horizon_minutes is not None:
                 query = query.where(SignalEvaluationRecord.horizon_minutes == horizon_minutes)
+            if engine_version is not None:
+                query = query.where(
+                    SignalRecord.observed_facts["engine_version"].as_string() == engine_version
+                )
             rows = (await session.execute(query)).all()
 
         grouped: dict[
@@ -515,6 +582,14 @@ class Database:
                     ),
                     "median_observed_change_percent": (
                         Decimal(str(median(returns))) if returns else None
+                    ),
+                    "positive_percent": (
+                        Decimal(sum(value > 0 for value in returns)) * 100 / Decimal(len(returns))
+                        if returns else None
+                    ),
+                    "negative_percent": (
+                        Decimal(sum(value < 0 for value in returns)) * 100 / Decimal(len(returns))
+                        if returns else None
                     ),
                     "mean_max_observed_increase_percent": _mean(
                         evaluation.max_increase_percent for evaluation in measured

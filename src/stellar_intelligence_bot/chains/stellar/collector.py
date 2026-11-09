@@ -14,6 +14,7 @@ from stellar_intelligence_bot.core.events import Chain, ChainEvent
 from stellar_intelligence_bot.core.markets import MarketPair
 
 EXPLORER_TX = "https://stellar.expert/explorer/public/tx"
+MAX_CHAIN_PAGES_PER_CYCLE = 5
 
 
 class StellarCollector:
@@ -32,16 +33,24 @@ class StellarCollector:
             yield item
         async for item in self._operation_events():
             yield item
+        if not self.pairs:
+            return
+        horizon = await self.client.get_json("")
+        watermark = _parse_time(horizon.get("history_latest_ledger_closed_at"))
         for pair in self.pairs:
+            has_cursor = await self.cursors.get_cursor(f"stellar:trades:{pair.key}") is not None
             async for item in self._trade_events(pair):
                 yield item
-            yield await self._market_snapshot(pair)
+            yield await self._market_snapshot(
+                pair, trade_watermark=watermark if has_cursor else None
+            )
 
     async def _operation_events(self) -> AsyncIterator[CollectedEvent]:
         stream = "stellar:operations"
         cursor = await self.cursors.get_cursor(stream)
         async for record in self.client.records(
-            "operations", cursor=cursor, params={"include_failed": "false"}
+            "operations", cursor=cursor, params={"include_failed": "false"},
+            max_pages=MAX_CHAIN_PAGES_PER_CYCLE,
         ):
             event = parse_payment_operation(record)
             page_cursor = str(record["paging_token"])
@@ -53,7 +62,9 @@ class StellarCollector:
     async def _ledger_events(self) -> AsyncIterator[CollectedEvent]:
         stream = "stellar:ledgers"
         cursor = await self.cursors.get_cursor(stream)
-        async for record in self.client.records("ledgers", cursor=cursor):
+        async for record in self.client.records(
+            "ledgers", cursor=cursor, max_pages=MAX_CHAIN_PAGES_PER_CYCLE
+        ):
             page_cursor = str(record["paging_token"])
             sequence = record.get("sequence")
             if not isinstance(sequence, int):
@@ -95,10 +106,13 @@ class StellarCollector:
                 quote_amount=quote_amount,
             )
 
-    async def _market_snapshot(self, pair: MarketPair) -> CollectedEvent:
+    async def _market_snapshot(
+        self, pair: MarketPair, *, trade_watermark: datetime | None = None
+    ) -> CollectedEvent:
         payload = await self.client.order_book(pair)
         observed_at = datetime.now(UTC)
-        bids = _parse_order_levels(payload.get("bids", []), "bids")
+        raw_bids = _parse_order_levels(payload.get("bids", []), "bids")
+        bids = [(price, amount / price) for price, amount in raw_bids]
         asks = _parse_order_levels(payload.get("asks", []), "asks")
         best_bid = max((price for price, _ in bids), default=None)
         best_ask = min((price for price, _ in asks), default=None)
@@ -114,10 +128,15 @@ class StellarCollector:
             "largest_ask_amount": max((amount for _, amount in asks), default=Decimal(0)),
             "bid_levels": len(bids),
             "ask_levels": len(asks),
+            "bid_depth_units": "base",
         }
+        if trade_watermark is not None:
+            if trade_watermark > observed_at:
+                raise ValueError("Horizon trade watermark is in the future")
+            trade_facts["trade_scan_complete_through"] = trade_watermark.isoformat()
         source_ref = (
             f"{self.client.base_url}/order_book?"
-            f"{urlencode(pair.horizon_params() | {'limit': '20'})}"
+            f"{urlencode(pair.order_book_params() | {'limit': '20'})}"
         )
         event = ChainEvent(
             event_id=f"stellar:order_book:{pair.key}:{observed_at.isoformat()}",
@@ -173,8 +192,19 @@ def parse_payment_operation(record: Mapping[str, Any]) -> ChainEvent | None:
 def parse_trade(record: Mapping[str, Any], pair: MarketPair) -> tuple[ChainEvent, Decimal, Decimal]:
     base_amount = _decimal(record["base_amount"])
     quote_amount = _decimal(record["counter_amount"])
-    if base_amount <= 0 or quote_amount <= 0:
-        raise ValueError("Trade amounts must be positive")
+    if base_amount <= 0 or quote_amount < 0:
+        raise ValueError("Trade base amount must be positive and quote amount nonnegative")
+    if quote_amount == 0:
+        raw_price = record.get("price")
+        if not isinstance(raw_price, Mapping):
+            raise ValueError("Zero-quote trade must include a rational Horizon price")
+        numerator = _decimal(raw_price.get("n"))
+        denominator = _decimal(raw_price.get("d"))
+        if numerator <= 0 or denominator <= 0:
+            raise ValueError("Zero-quote trade must include a positive rational price")
+        trade_price = numerator / denominator
+    else:
+        trade_price = quote_amount / base_amount
     occurred_at = _parse_time(record["ledger_close_time"])
     trade_id = str(record.get("id", record["paging_token"]))
     transaction_hash = record.get("transaction_hash")
@@ -191,8 +221,12 @@ def parse_trade(record: Mapping[str, Any], pair: MarketPair) -> tuple[ChainEvent
         "pair": pair.key,
         "base_amount": base_amount,
         "quote_amount": quote_amount,
-        "price": quote_amount / base_amount,
+        "price": trade_price,
+        "price_source": "horizon_rational" if quote_amount == 0 else "executed_amounts",
     }
+    trade_type = record.get("trade_type")
+    if trade_type in ("orderbook", "liquidity_pool"):
+        attributes["trade_type"] = str(trade_type)
     event = ChainEvent(
         event_id=f"stellar:trade:{trade_id}",
         chain=Chain.STELLAR,
@@ -211,7 +245,15 @@ def _parse_order_levels(values: object, field: str) -> list[tuple[Decimal, Decim
     for level in values:
         if not isinstance(level, Mapping):
             raise ValueError(f"Malformed order-book {field} entry")
-        price = _decimal(level.get("price"))
+        rational = level.get("price_r")
+        if isinstance(rational, Mapping):
+            numerator = _decimal(rational.get("n"))
+            denominator = _decimal(rational.get("d"))
+            if denominator <= 0:
+                raise ValueError(f"Invalid order-book {field} price denominator")
+            price = numerator / denominator
+        else:
+            price = _decimal(level.get("price"))
         amount = _decimal(level.get("amount"))
         if price <= 0 or amount < 0:
             raise ValueError(f"Invalid order-book {field} price or amount")

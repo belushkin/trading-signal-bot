@@ -66,6 +66,47 @@ async def test_empty_database_and_unconfigured_markets_are_explicit(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_analytics_excludes_legacy_signals_and_reports_pending_outcomes(tmp_path) -> None:
+    async with _api(str(tmp_path / "engine.db"), Settings()) as (client, database):
+        now = datetime.now(UTC)
+        async with database.sessions.begin() as session:
+            for name in ("legacy", "current"):
+                session.add(
+                    EventRecord(
+                        event_id=name, chain="stellar", event_type="market_snapshot",
+                        occurred_at=now, source_ref="https://horizon.stellar.org/order_book",
+                        attributes={},
+                    )
+                )
+                session.add(
+                    SignalRecord(
+                        signal_id=name, deduplication_key=name, event_id=name, occurred_at=now,
+                        category="spread_anomaly", severity="WATCH", confidence="HIGH",
+                        observed_facts={"pair": PAIR} | (
+                            {"engine_version": "market-anomaly-v1"} if name == "current" else {}
+                        ),
+                        interpretation="Observed spread", expires_at=now + timedelta(minutes=30),
+                    )
+                )
+                session.add(
+                    SignalEvaluationRecord(
+                        signal_id=name, pair_key=PAIR, horizon_minutes=5,
+                        target_at=now + timedelta(minutes=5), reference_at=now,
+                        reference_price=Decimal(1), status="pending", data_quality="pending",
+                        observation_count=0,
+                    )
+                )
+        response = await client.get("/api/analytics?days=1")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["excluded_legacy_signals"] == 1
+    assert data["signals_by_category"] == [{"category": "spread_anomaly", "count": 1}]
+    assert data["data_coverage"]["pending_evaluations"] == 1
+    assert data["outcomes_by_pair"][0]["signals"] == 1
+    assert data["outcomes_by_pair"][0]["mean_observed_change_percent"] is None
+
+
+@pytest.mark.asyncio
 async def test_started_collector_without_completed_cycle_is_starting(tmp_path) -> None:
     async with _api(str(tmp_path / "starting.db"), Settings()) as (client, database):
         await database.start_health(datetime.now(UTC))
@@ -76,6 +117,23 @@ async def test_started_collector_without_completed_cycle_is_starting(tmp_path) -
     assert health["collector"]["status"] == "starting"
     assert overview["collector"]["status"] == "starting"
     assert "collector_starting" in {item["code"] for item in overview["warnings"]}
+
+
+@pytest.mark.asyncio
+async def test_watchlist_exposes_tiers_disabled_pairs_and_missing_data(tmp_path) -> None:
+    settings = Settings.from_env()
+    async with _api(str(tmp_path / "watchlist.db"), settings) as (client, _):
+        markets = (await client.get("/api/markets")).json()["items"]
+        details = await client.get(f"/api/markets/{settings.watchlist[4].pair.key}")
+
+    assert len(markets) == 6
+    assert [market["tier"] for market in markets] == [1, 1, 1, 1, 2, 2]
+    assert [market["enabled"] for market in markets] == [True, True, True, True, False, False]
+    assert all(market["status"] == "no_data" for market in markets)
+    assert all(market["trade_count_24h"] is None for market in markets)
+    assert details.status_code == 200
+    assert details.json()["summary"]["enabled"] is False
+    assert details.json()["recent_trades"] == []
 
 
 @pytest.mark.asyncio
@@ -115,7 +173,10 @@ async def test_missing_market_observations_and_stale_persisted_data(tmp_path) ->
     assert missing["status"] == "no_data"
     assert missing["latest_price"] is None
     assert missing["volume_24h_base"] is None
+    assert missing["trade_ingestion_status"] == "unverified"
+    assert missing["last_trade_scan_through"] is None
     assert stale["status"] == "stale"
+    assert stale["trade_ingestion_status"] == "unverified"
     assert Decimal(stale["latest_price"]) == Decimal("10")
     assert detail.status_code == 200
     assert Decimal(detail.json()["history"][0]["price"]) == Decimal("10")

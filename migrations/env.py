@@ -16,7 +16,7 @@ config.set_main_option(
     os.getenv("BOT_DATABASE_URL", config.get_main_option("sqlalchemy.url")).replace("%", "%%"),
 )
 if config.config_file_name is not None:
-    fileConfig(config.config_file_name)
+    fileConfig(config.config_file_name, disable_existing_loggers=False)
 
 target_metadata = Base.metadata
 

@@ -71,3 +71,6 @@ class MarketPair:
 
     def horizon_params(self) -> dict[str, str]:
         return self.base.horizon_params("base") | self.quote.horizon_params("counter")
+
+    def order_book_params(self) -> dict[str, str]:
+        return self.base.horizon_params("selling") | self.quote.horizon_params("buying")

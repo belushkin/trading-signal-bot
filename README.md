@@ -4,11 +4,23 @@ A read-only, human-in-the-loop Stellar activity and market monitor. It does not 
 
 ## Current implementation
 
-The service currently collects new ledger summaries and payment operations from public Stellar Horizon, plus trade history and order-book snapshots for configured pairs. It persists normalized events, trades, five-minute volume windows, market snapshots, signal history, and per-stream cursors. Signals cover configured large transfers, unusually high pair volume after a baseline is available, large visible orders, and wide spreads.
+The service currently collects new ledger summaries and payment operations from public Stellar Horizon, plus trade history and order-book snapshots for configured pairs. It persists normalized events, trades, five-minute volume windows, market snapshots, signal history, and per-stream cursors. Market signals compare spread, sampled mid-price movements and completed trade volume with each pair's own history. Configured large-transfer signals remain separate.
 
 Signal outcome evaluation, PostgreSQL deployment, health checks, retention, and a read-only web dashboard are implemented. The dashboard reads persisted collector data through a FastAPI API and does not connect directly to Stellar. Discord notifications and control commands are intentionally omitted for now.
 
-Large transfers are not interpreted as buys or sells. Visible offers can change or cancel and are not evidence of execution. This MVP does not reconstruct historical order books, collect every transaction body, monitor AMM pools, or deliver Discord notifications.
+Large transfers are not interpreted as buys or sells. The prior fixed-spread, visible-offer and volume rules no longer run. The new volume and large-trade rules require recorded cursor-based scans and Horizon ledger watermarks; pre-existing observations cannot establish that coverage. Depth-change alerts are not implemented because top-20 order books are not fixed price ranges. This MVP does not reconstruct historical order books, collect every transaction body, monitor AMM pools, or deliver Discord notifications.
+
+The spread rule needs a fresh two-sided book and at least 20 observations over a continuous hour, with gaps of at most two minutes; it triggers at the greater of the configured floor and three times the pair's median spread. Price movement uses 5, 15, 60 and 240 minute windows by default. Each needs continuous samples across the current window and three preceding equivalent windows, with at least three prices near each endpoint; the threshold is the greater of the configured floor and three times the median preceding absolute return. These are exploratory thresholds, not demonstrated predictive value. Price changes use sampled bid/ask midpoints, not executed-trade prices.
+
+The volume rule compares the latest completed five-minute window against the mean of the configured number of preceding completed windows. A saved Horizon history-ledger watermark and successful cursor-based scan must cover the full interval, with no gaps over two minutes and a fresh watermark; the first truncated bootstrap scan does not establish coverage. Only then can a window without persisted trades count as zero. Volumes combine order-book and liquidity-pool trades and cannot be attributed to either venue. Provider history and watermark correctness remain assumptions.
+
+Ledger and operation streams process at most five Horizon pages per cycle so their backlog cannot indefinitely starve market collection. Their persisted cursors resume on the next cycle, so activity can lag even while the collector heartbeat is healthy; monitor the latest event timestamps as well as health.
+
+Horizon can report a tiny trade with a positive base amount and zero quote amount. The collector persists the actual amounts and the provider's rational price separately; the dashboard does not present that rational price as an executed price, and the large-trade rule excludes zero-notional trades.
+
+Large-trade alerts compare the trade's quote-asset notional with the median of up to 500 prior trades in the same pair and venue over the preceding hour. They require at least 100 prior trades, continuous watermarked scans, a fresh trade, ten times the median, and at least 10,000 XLM by default. The XLM floor prevents a tiny relative baseline alone from creating an alert; it is an exploratory minimum, not a valuation in USD. Unknown venue trades and non-XLM-base pairs are excluded. The signal preserves the original trade and does not infer intent.
+
+Five subsequent midpoint observations are evaluated at 5, 15, 60, 240 and 1440 minutes when data is available. Analytics excludes legacy signals, including those created before the bid-depth correction; their records remain visible in Signals and are not recalculated. Returns are descriptive, not profitability or directional accuracy. Averages and percentages in the dashboard require at least ten measured outcomes.
 
 ## Run locally
 
@@ -24,7 +36,7 @@ export BOT_WHALE_THRESHOLDS='native=100000,USDC:G...=50000'
 python -m stellar_intelligence_bot
 ```
 
-Replace `G...` with a real Stellar issuer public key. Configure monitored pairs as comma-separated `BASE/QUOTE` asset identifiers; each asset is `native` or `CODE:ISSUER`. Configure whale thresholds as comma-separated `ASSET=AMOUNT` entries in that asset's units. With no pairs configured, the process still collects ledgers and payment operations but does not collect market data.
+Replace `G...` with a real Stellar issuer public key. Configure monitored pairs as comma-separated `BASE/QUOTE` asset identifiers; each asset is `native` or `CODE:ISSUER`. Configure whale thresholds as comma-separated `ASSET=AMOUNT` entries in that asset's units. By default the verified Tier 1 watchlist is enabled. Set `BOT_WATCHLIST_ENABLED=''` to disable all default markets; ledger and payment collection continues.
 
 Settings:
 
@@ -32,14 +44,21 @@ Settings:
 |---|---:|---|
 | `BOT_HORIZON_URL` | `https://horizon.stellar.org` | Public or self-hosted Horizon URL |
 | `BOT_DATABASE_URL` | `sqlite+aiosqlite:///./stellar-intelligence.db` | SQLAlchemy async SQLite or PostgreSQL URL (`postgresql+asyncpg://...`) |
-| `BOT_MONITORED_PAIRS` | empty | Comma-separated `BASE/QUOTE` pairs |
+| `BOT_MONITORED_PAIRS` | empty | Non-empty comma-separated `BASE/QUOTE` pairs override the watchlist |
+| `BOT_WATCHLIST_ENABLED` | `USDC,SHX,VELO,AQUA` | Comma-separated watchlist codes; add `BTC` or `XRP` to enable Tier 2, empty disables all |
 | `BOT_WHALE_THRESHOLDS` | empty | Per-asset transfer thresholds, e.g. `native=100000` |
 | `BOT_POLL_INTERVAL_SECONDS` | `15` | Poll interval; minimum 5 seconds |
-| `BOT_VOLUME_BASELINE_SAMPLES` | `20` | Number of preceding five-minute trade windows required |
-| `BOT_VOLUME_ANOMALY_MULTIPLIER` | `3` | Current volume threshold relative to mean baseline |
-| `BOT_LARGE_ORDER_THRESHOLD` | `10000` | Minimum visible order size in base-asset units |
-| `BOT_SPREAD_THRESHOLD_PERCENT` | `1` | Wide-spread signal threshold |
+| `BOT_VOLUME_BASELINE_SAMPLES` | `20` | Prior covered five-minute windows needed for volume baseline |
+| `BOT_VOLUME_ANOMALY_MULTIPLIER` | `3` | Completed-window volume threshold relative to mean baseline |
+| `BOT_LARGE_ORDER_THRESHOLD` | `10000` | Legacy setting; visible-offer alerts are disabled |
+| `BOT_LARGE_TRADE_MIN_XLM` | `10000` | Absolute XLM minimum for large-trade alerts |
+| `BOT_SPREAD_THRESHOLD_PERCENT` | `1` | Minimum percentage threshold for baseline-relative spread widening |
+| `BOT_PRICE_ANOMALY_FLOOR_PERCENT` | `1` | Minimum absolute sampled mid-price change percentage |
+| `BOT_PRICE_WINDOWS_MINUTES` | `5,15,60,240` | Enabled price windows, selected from 5, 15, 60 and 240 minutes |
 | `BOT_LOG_LEVEL` | `INFO` | Standard logging level |
+| `BOT_RETENTION_DAYS` | `30` | Delete observations older than this many days during periodic cleanup |
+
+The exact issuer identities and tier defaults are defined once in [watchlist.json](src/stellar_intelligence_bot/app/watchlist.json); see [the market verification record](docs/market-watchlist.md) for sources and limitations. A non-empty `BOT_MONITORED_PAIRS` takes precedence over `BOT_WATCHLIST_ENABLED`; an empty `BOT_MONITORED_PAIRS` alone no longer disables the default watchlist.
 
 The process applies Alembic migrations on startup. To run or inspect migrations manually, use `alembic upgrade head` or `alembic current`. PostgreSQL is supported for persistence. Configure retention and follow the backup and health-check procedures in the deployment guide; do not put credentials in the repository.
 
@@ -78,7 +97,8 @@ mypy src
 
 - Data comes from the configured Horizon endpoint. Availability, rate limits, and historical retention depend on that operator. The client handles pagination, transient 429/5xx/network failures, and retry backoff.
 - When a stream has no saved cursor, collection bootstraps from Horizon's latest page; older history is not backfilled. Cursor advancement and event persistence share a database transaction, and duplicate event IDs are ignored.
-- The volume baseline uses the latest persisted five-minute windows containing trades. Signals remain unavailable until enough baseline windows exist; zero-trade windows are not currently materialized.
+- The volume baseline uses the latest persisted five-minute windows containing trades. Signals remain unavailable until enough baseline windows exist; zero-trade windows are not currently materialized. Horizon trade volume can include order-book and liquidity-pool trades; old stored trades do not identify their type.
+- Prior to the watchlist update, order-book bid amounts were treated as base units rather than quote units. Older bid-depth readings are hidden in the dashboard, but historical signals and evaluations are not recomputed. Earlier snapshots also used rounded Horizon prices.
 - Confidence is qualitative, not a probability: `HIGH` means the signal's measured facts come directly from complete source fields and satisfy a configured rule. It does not imply predictive accuracy.
 - Signal severity is rule-based. A transfer at least ten times its configured threshold is `HIGH`; other configured transfer breaches are `WATCH`. Market anomaly and order-book rules currently emit `WATCH`, except an extreme volume breach (at least three times its configured trigger), which emits `HIGH`.
 - Signals expire after 30 minutes and matching deduplication keys have a 15-minute cooldown.

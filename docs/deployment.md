@@ -21,7 +21,7 @@ Set `POSTGRES_PASSWORD` to a unique long URL-safe value. To generate a hex passw
 openssl rand -hex 32
 ```
 
-Set `BOT_MONITORED_PAIRS` and, if needed, `BOT_WHALE_THRESHOLDS`. Leave either blank to disable those features. Then build and start:
+Set `BOT_WATCHLIST_ENABLED` to select the desired packaged watchlist entries and, if needed, `BOT_WHALE_THRESHOLDS`. Tier 1 is enabled by default; set `BOT_WATCHLIST_ENABLED` to an empty value to disable all default markets. A non-empty `BOT_MONITORED_PAIRS` overrides the watchlist with explicit `BASE/QUOTE` identities. Then build and start:
 
 ```sh
 docker compose up -d --build
@@ -51,6 +51,8 @@ docker compose logs --tail=100 api dashboard
 ```
 
 The API health response reports database availability, collector heartbeat freshness, and the configured refresh interval. Dashboard metrics use actual persisted events, signals, trades, order-book snapshots, and signal evaluations. Markets with no observations show N/A; stale snapshots are marked stale. Historical market-price charts show discrete midprice observation dots instead of connecting observations across gaps. The activity page links only to transaction hashes in the persisted StellarExpert source references.
+
+The default watchlist increases Horizon requests and starts market collection immediately. Review [the market verification record](market-watchlist.md) before enabling pairs. The dashboard's trade volumes are observed partial totals, potentially mixing order-book and liquidity-pool trades, not guaranteed full-market 24-hour volume. Older snapshots have unverified bid-depth units and are shown as N/A for bid depth.
 
 Check runtime status and signal evaluation reports:
 
@@ -107,7 +109,9 @@ For production recovery, use a maintenance window and an operator-approved, veri
 
 ## Retention and storage
 
-`BOT_RETENTION_DAYS` defaults to 90 and must be at least one. Once per collector run day, the app deletes old events, trades, market snapshots, volume windows, signals, and their evaluation rows in one transaction. Processing cursors and runtime health are preserved. Retention does not replace backups or database capacity monitoring. PostgreSQL WAL, indexes, backups, and filesystem space also consume storage.
+`BOT_RETENTION_DAYS` defaults to 30 and must be at least one. After a successful collection cycle, the collector periodically deletes events, trades, market snapshots, volume windows, and signals older than the retention cutoff, plus associated signal evaluations. Signals linked to expired events are also removed. Cleanup runs at most once every 24 hours and may be delayed if collection cycles do not complete. Processing cursors and runtime health are preserved.
+
+Existing `.env` values override the default. After changing `.env`, recreate the collector as described above; a restart alone does not apply the new value. The next eligible cleanup permanently deletes records already older than the cutoff, so make a backup first if you need that history. PostgreSQL can reuse freed space, but deletion does not necessarily shrink its files immediately. Retention does not replace backups or database capacity monitoring; WAL, indexes, backups, and filesystem space also consume storage.
 
 ## Stop and inspect
 

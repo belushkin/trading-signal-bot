@@ -2,6 +2,7 @@ from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 import pytest
+from sqlalchemy import event as sqlalchemy_event
 
 from stellar_intelligence_bot.core.events import Chain, ChainEvent
 from stellar_intelligence_bot.core.markets import MarketPair
@@ -80,6 +81,36 @@ async def test_trade_event_cursor_and_volume_bucket_commit_together(tmp_path) ->
 
 
 @pytest.mark.asyncio
+async def test_zero_quote_trade_persists_actual_volume_and_provider_price(tmp_path) -> None:
+    from sqlalchemy import select
+
+    from stellar_intelligence_bot.storage.models import TradeRecord
+
+    database = Database(f"sqlite+aiosqlite:///{tmp_path / 'zero-quote.db'}")
+    await database.initialize()
+    pair = MarketPair.parse("native/USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+    event = ChainEvent(
+        event_id="trade:zero-quote", chain=Chain.STELLAR, event_type="trade",
+        occurred_at=datetime(2026, 1, 1, tzinfo=UTC),
+        source_ref="https://horizon.stellar.org/trades/1",
+        attributes={"pair": pair.key, "price": Decimal("0.147361"),
+                    "price_source": "horizon_rational"},
+    )
+    try:
+        assert await database.save_trade_event(
+            event, "trades", "1", pair, Decimal("0.0000001"), Decimal(0)
+        )
+        async with database.sessions() as session:
+            trade = await session.scalar(select(TradeRecord))
+        assert trade is not None
+        assert trade.quote_amount == 0
+        assert abs(trade.price - Decimal("0.147361")) < Decimal("0.000000000000001")
+        assert await database.current_window_volume(pair, event.occurred_at) == Decimal("0.0000001")
+    finally:
+        await database.close()
+
+
+@pytest.mark.asyncio
 async def test_volume_baseline_uses_only_preceding_windows(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'baseline.db'}")
     await database.initialize()
@@ -114,6 +145,10 @@ async def test_volume_baseline_uses_only_preceding_windows(tmp_path) -> None:
 @pytest.mark.asyncio
 async def test_market_signal_evaluation_measures_price_and_sampled_extremes(tmp_path) -> None:
     database = Database(f"sqlite+aiosqlite:///{tmp_path / 'evaluation.db'}")
+    @sqlalchemy_event.listens_for(database.engine.sync_engine, "connect")
+    def enable_foreign_keys(connection, _record) -> None:
+        connection.execute("PRAGMA foreign_keys=ON")
+
     await database.initialize()
     issuer = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
     pair = MarketPair.parse(f"native/USDC:{issuer}")

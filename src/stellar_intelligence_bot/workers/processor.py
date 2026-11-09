@@ -1,13 +1,21 @@
 """Persist collected Stellar observations and evaluate signal rules."""
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
 from stellar_intelligence_bot.chains.base import CollectedEvent
+from stellar_intelligence_bot.core.events import Chain, ChainEvent
+from stellar_intelligence_bot.core.market_anomalies import (
+    BookObservation,
+    TradeObservation,
+    large_trade_signal,
+    market_anomaly_signals,
+    trade_watermark,
+    volume_anomaly_signal,
+    volume_coverage,
+)
 from stellar_intelligence_bot.core.signal_engine import (
     SIGNAL_COOLDOWN,
-    order_book_signals,
-    volume_signal,
     whale_signal,
 )
 from stellar_intelligence_bot.storage.database import Database
@@ -23,13 +31,19 @@ class EventProcessor:
         anomaly_multiplier: Decimal,
         large_order_threshold: Decimal,
         spread_threshold_percent: Decimal,
+        large_trade_min_xlm: Decimal = Decimal("10000"),
+        price_anomaly_floor_percent: Decimal = Decimal("1"),
+        price_windows_minutes: tuple[int, ...] = (5, 15, 60, 240),
     ) -> None:
         self.database = database
         self.whale_thresholds = whale_thresholds
         self.baseline_samples = baseline_samples
         self.anomaly_multiplier = anomaly_multiplier
         self.large_order_threshold = large_order_threshold
+        self.large_trade_min_xlm = large_trade_min_xlm
         self.spread_threshold_percent = spread_threshold_percent
+        self.price_anomaly_floor_percent = price_anomaly_floor_percent
+        self.price_windows_minutes = price_windows_minutes
 
     async def process(self, item: CollectedEvent) -> None:
         event = item.event
@@ -93,33 +107,94 @@ class EventProcessor:
         if not inserted:
             return
 
-        current_window = event.occurred_at.replace(
-            minute=(event.occurred_at.minute // 5) * 5, second=0, microsecond=0
+        rows = await self.database.book_observations(
+            pair,
+            event.occurred_at - timedelta(
+                minutes=max(
+                    60, max(self.price_windows_minutes) * 4, (self.baseline_samples + 2) * 5
+                )
+            ),
+            event.occurred_at,
         )
-        baseline = await self.database.volume_baseline(
-            pair, self.baseline_samples, current_window
-        )
-        if baseline is not None:
-            baseline_volume, sample_count = baseline
-            current_volume = await self.database.current_window_volume(pair, current_window)
-            signal = volume_signal(
-                event,
-                pair.key,
-                current_volume,
-                baseline_volume,
-                sample_count,
-                self.anomaly_multiplier,
+        observations = [
+            BookObservation(
+                row.observed_at.replace(tzinfo=UTC)
+                if row.observed_at.tzinfo is None
+                else row.observed_at.astimezone(UTC),
+                row.best_bid,
+                row.best_ask,
+                trade_watermark(row.observed_facts),
             )
-            if signal is not None:
-                await self.database.save_signal(signal, SIGNAL_COOLDOWN)
-
-        for signal in order_book_signals(
+            for row in rows
+            if row.best_bid is not None and row.best_ask is not None
+        ]
+        for signal in market_anomaly_signals(
             event,
             pair.key,
-            large_order_threshold=self.large_order_threshold,
-            spread_threshold_percent=self.spread_threshold_percent,
+            observations,
+            now=datetime.now(UTC),
+            spread_floor_percent=self.spread_threshold_percent,
+            price_floor_percent=self.price_anomaly_floor_percent,
+            windows=self.price_windows_minutes,
         ):
             await self.database.save_signal(signal, SIGNAL_COOLDOWN)
+
+        covered = volume_coverage(observations, event.occurred_at, self.baseline_samples)
+        if covered is not None:
+            volumes = await self.database.volume_windows(pair, *covered)
+            volume_candidate = volume_anomaly_signal(
+                event, pair.key, observations, volumes, now=datetime.now(UTC),
+                samples=self.baseline_samples, multiplier=self.anomaly_multiplier,
+            )
+            if volume_candidate is not None:
+                await self.database.save_signal(volume_candidate, SIGNAL_COOLDOWN)
+
+        trade_coverage = volume_coverage(observations, event.occurred_at, 12)
+        markers = [
+            book for book in observations
+            if book.trade_watermark is not None and book.observed_at < event.occurred_at
+        ]
+        latest_watermark = trade_watermark(dict(attrs))
+        if (
+            pair.base.code is None
+            and trade_coverage is not None
+            and markers
+            and latest_watermark is not None
+        ):
+            previous_watermark = markers[-1].trade_watermark
+            if previous_watermark is not None and previous_watermark < latest_watermark:
+                trade_rows = await self.database.trades_with_events(
+                    pair, trade_coverage[0], latest_watermark
+                )
+                trades = [
+                    TradeObservation(
+                        ChainEvent(
+                            event_id=trade.trade_id,
+                            chain=Chain.STELLAR,
+                            event_type="trade",
+                            occurred_at=(
+                                trade.occurred_at.replace(tzinfo=UTC)
+                                if trade.occurred_at.tzinfo is None
+                                else trade.occurred_at.astimezone(UTC)
+                            ),
+                            source_ref=source.source_ref,
+                        ),
+                        trade.base_amount,
+                        trade.quote_amount,
+                        str(source.attributes.get("trade_type"))
+                        if isinstance(source.attributes.get("trade_type"), str)
+                        else None,
+                    )
+                    for trade, source in trade_rows
+                ]
+                for trade in trades:
+                    if previous_watermark < trade.event.occurred_at <= latest_watermark:
+                        candidate = large_trade_signal(
+                            trade, trades, pair.key, now=datetime.now(UTC),
+                            minimum_xlm=self.large_trade_min_xlm, coverage_start=trade_coverage[0],
+                        )
+                        if candidate is not None:
+                            await self.database.save_signal(candidate, SIGNAL_COOLDOWN)
 
 
 def _optional_decimal(value: object) -> Decimal | None:

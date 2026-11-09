@@ -169,8 +169,9 @@ def _signal(
     severity: Severity,
     facts: dict[str, object],
     interpretation: str,
+    confidence: Confidence = Confidence.HIGH,
 ) -> Signal:
-    signal_id = hashlib.sha256(f"{event.event_id}:{category}".encode()).hexdigest()
+    signal_id = hashlib.sha256(f"{event.event_id}:{category}:{dedupe_key}".encode()).hexdigest()
     return Signal(
         signal_id=signal_id,
         deduplication_key=dedupe_key,
@@ -178,7 +179,7 @@ def _signal(
         occurred_at=event.occurred_at,
         category=category,
         severity=severity,
-        confidence=Confidence.HIGH,
+        confidence=confidence,
         observed_facts=facts,
         interpretation=interpretation,
         expires_at=event.occurred_at + SIGNAL_TTL,

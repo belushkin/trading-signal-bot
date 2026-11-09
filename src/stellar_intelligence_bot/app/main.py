@@ -30,6 +30,7 @@ async def run() -> None:
     settings = Settings.from_env()
     configure_logging(settings.log_level)
     await asyncio.to_thread(_upgrade_schema, settings.database_url)
+    logging.getLogger().setLevel(settings.log_level)
     database = Database(settings.database_url)
     await database.initialize()
     started_at = datetime.now(UTC)
@@ -48,7 +49,10 @@ async def run() -> None:
                 baseline_samples=settings.volume_baseline_samples,
                 anomaly_multiplier=settings.volume_anomaly_multiplier,
                 large_order_threshold=settings.large_order_threshold,
+                large_trade_min_xlm=settings.large_trade_min_xlm,
                 spread_threshold_percent=settings.spread_threshold_percent,
+                price_anomaly_floor_percent=settings.price_anomaly_floor_percent,
+                price_windows_minutes=settings.price_windows_minutes,
             )
             delay = settings.poll_interval_seconds
             logger.info(

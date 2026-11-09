@@ -89,7 +89,10 @@ class HorizonClient:
         *,
         cursor: str | None,
         params: Mapping[str, str] | None = None,
+        max_pages: int | None = None,
     ) -> AsyncIterator[dict[str, Any]]:
+        if max_pages is not None and max_pages < 1:
+            raise ValueError("max_pages must be positive")
         query = dict(params or {})
         query["limit"] = "200"
         query["order"] = "asc" if cursor else "desc"
@@ -98,10 +101,12 @@ class HorizonClient:
         else:
             query["order"] = "desc"
 
+        pages = 0
         while True:
             payload = await self.get_json(path, query)
-            embedded = payload.get("_embedded", {})
-            records = embedded.get("records", []) if isinstance(embedded, dict) else []
+            pages += 1
+            embedded = payload.get("_embedded")
+            records = embedded.get("records") if isinstance(embedded, dict) else None
             if not isinstance(records, list):
                 raise ValueError(f"Unexpected Horizon records payload from {path}")
             if not records:
@@ -109,10 +114,11 @@ class HorizonClient:
 
             ordered = records if cursor else list(reversed(records))
             for record in ordered:
-                if isinstance(record, dict):
-                    yield record
+                if not isinstance(record, dict):
+                    raise ValueError(f"Malformed Horizon record on {path}")
+                yield record
 
-            if not cursor or len(records) < 200:
+            if not cursor or len(records) < 200 or (max_pages is not None and pages >= max_pages):
                 return
             last_record = records[-1]
             next_cursor = last_record.get("paging_token")
@@ -121,6 +127,6 @@ class HorizonClient:
             query["cursor"] = next_cursor
 
     async def order_book(self, pair: MarketPair) -> dict[str, Any]:
-        params = pair.base.horizon_params("selling") | pair.quote.horizon_params("buying")
+        params = pair.order_book_params()
         params["limit"] = "20"
         return await self.get_json("order_book", params)

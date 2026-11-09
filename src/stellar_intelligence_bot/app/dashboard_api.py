@@ -18,6 +18,14 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 
 from stellar_intelligence_bot.app.config import Settings
+from stellar_intelligence_bot.core.market_anomalies import (
+    LARGE_TRADE_MIN_SAMPLES,
+    BookObservation,
+    market_readiness,
+    trade_watermark,
+    volume_coverage,
+)
+from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.storage.database import Database
 from stellar_intelligence_bot.storage.models import (
     EventRecord,
@@ -161,7 +169,8 @@ def create_app(
                 {
                     "code": "no_markets_configured",
                     "message": (
-                        "No markets are configured. Set BOT_MONITORED_PAIRS to collect market data."
+                        "No markets are configured. Set BOT_WATCHLIST_ENABLED or "
+                        "BOT_MONITORED_PAIRS to collect market data."
                     ),
                 }
             )
@@ -228,6 +237,12 @@ def create_app(
         config: Settings = request.app.state.settings
         try:
             items = await _market_summaries(db, config, datetime.now(UTC))
+            for entry in config.watchlist:
+                if not entry.enabled and entry.pair not in config.monitored_pairs:
+                    summary = await _market_summary(db, entry.pair.key, config, datetime.now(UTC))
+                    summary["tier"] = entry.tier
+                    summary["enabled"] = False
+                    items.append(summary)
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Market data is temporarily unavailable") from exc
         return {
@@ -235,7 +250,7 @@ def create_app(
             "monitored_pairs": [pair.key for pair in config.monitored_pairs],
             "message": None
             if items
-            else "No markets are configured. Set BOT_MONITORED_PAIRS to monitor Stellar pairs.",
+            else "No markets are configured. Enable watchlist entries to monitor Stellar pairs.",
         }
 
     @app.get("/api/markets/{pair_id:path}")
@@ -245,16 +260,19 @@ def create_app(
         history_hours: Annotated[int, Query(ge=1, le=720)] = 24,
     ) -> dict[str, object]:
         config: Settings = request.app.state.settings
-        pair = next(
-            (candidate for candidate in config.monitored_pairs if candidate.key == pair_id), None
-        )
+        candidates = config.monitored_pairs + tuple(entry.pair for entry in config.watchlist)
+        pair = next((candidate for candidate in candidates if candidate.key == pair_id), None)
         if pair is None:
             raise HTTPException(404, "Market is not in the configured monitored-pair list")
         db: Database = request.app.state.database
         now = datetime.now(UTC)
         cutoff = now - timedelta(hours=history_hours)
         try:
-            summary = await _market_summary(db, pair.key, _stale_after(config), now)
+            summary = await _market_summary(db, pair.key, config, now)
+            summary["tier"] = next(
+                (entry.tier for entry in config.watchlist if entry.pair == pair), None
+            )
+            summary["enabled"] = pair in config.monitored_pairs
             async with db.sessions() as session:
                 snapshots = (
                     await session.scalars(
@@ -275,6 +293,13 @@ def create_app(
                         .limit(2000)
                     )
                 ).all()
+                trade_events = (
+                    await session.scalars(
+                        select(EventRecord).where(
+                            EventRecord.event_id.in_([item.trade_id for item in trades[:20]])
+                        )
+                    )
+                ).all()
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Market history is temporarily unavailable") from exc
         history = [
@@ -286,12 +311,18 @@ def create_app(
                 and item.best_bid > 0
                 and item.best_ask >= item.best_bid
                 else None,
-                "bid_depth": _decimal(item.bid_depth),
+                "bid_depth": _decimal(item.bid_depth)
+                if item.observed_facts.get("bid_depth_units") == "base"
+                else None,
                 "ask_depth": _decimal(item.ask_depth),
+                "best_bid": _decimal(item.best_bid),
+                "best_ask": _decimal(item.best_ask),
+                "spread_percent": _decimal(item.spread_percent),
             }
             for item in reversed(snapshots)
         ]
         volume_by_bucket: dict[str, Decimal] = {}
+        trade_types = {item.event_id: item.attributes.get("trade_type") for item in trade_events}
         for trade in trades:
             bucket = _as_utc(trade.occurred_at).replace(
                 minute=(_as_utc(trade.occurred_at).minute // 15) * 15, second=0, microsecond=0
@@ -306,6 +337,17 @@ def create_app(
                 {"observed_at": key, "base_volume": _decimal(value)}
                 for key, value in sorted(volume_by_bucket.items())
             ],
+            "recent_trades": [
+                {
+                    "occurred_at": _iso(_as_utc(item.occurred_at)),
+                    "price": _decimal(item.price) if item.quote_amount > 0 else None,
+                    "base_amount": _decimal(item.base_amount),
+                    "quote_amount": _decimal(item.quote_amount),
+                    "trade_type": trade_types.get(item.trade_id),
+                }
+                for item in trades[:20]
+            ],
+            "data_source": "Persisted Horizon trades and order-book snapshots",
             "history_hours": history_hours,
             "truncated": len(snapshots) == 1000 or len(trades) == 2000,
         }
@@ -391,6 +433,7 @@ def create_app(
             "observed_facts": _safe_facts(row.observed_facts),
             "interpretation": row.interpretation,
             "expires_at": _iso(_as_utc(row.expires_at)),
+            "deduplication_key": row.deduplication_key,
             "source": _event_source(event) if event else None,
             "evaluations": [_evaluation(item) for item in evaluations],
         }
@@ -463,12 +506,20 @@ def create_app(
     ) -> dict[str, object]:
         db: Database = request.app.state.database
         cutoff = datetime.now(UTC) - timedelta(days=days)
+        current_engine = SignalRecord.observed_facts["engine_version"].as_string() == (
+            "market-anomaly-v1"
+        )
         try:
             async with db.sessions() as session:
+                all_signals = await session.scalar(
+                    select(func.count()).select_from(SignalRecord).where(
+                        SignalRecord.occurred_at >= cutoff
+                    )
+                )
                 by_category = (
                     await session.execute(
                         select(SignalRecord.category, func.count())
-                        .where(SignalRecord.occurred_at >= cutoff)
+                        .where(SignalRecord.occurred_at >= cutoff, current_engine)
                         .group_by(SignalRecord.category)
                         .order_by(func.count().desc())
                     )
@@ -476,14 +527,14 @@ def create_app(
                 by_severity = (
                     await session.execute(
                         select(SignalRecord.severity, func.count())
-                        .where(SignalRecord.occurred_at >= cutoff)
+                        .where(SignalRecord.occurred_at >= cutoff, current_engine)
                         .group_by(SignalRecord.severity)
                     )
                 ).all()
                 frequency_rows = (
                     await session.execute(
                         select(func.date(SignalRecord.occurred_at), func.count())
-                        .where(SignalRecord.occurred_at >= cutoff)
+                        .where(SignalRecord.occurred_at >= cutoff, current_engine)
                         .group_by(func.date(SignalRecord.occurred_at))
                         .order_by(func.date(SignalRecord.occurred_at))
                     )
@@ -491,7 +542,10 @@ def create_app(
                 evaluation_counts = (
                     await session.execute(
                         select(SignalEvaluationRecord.status, func.count())
-                        .where(SignalEvaluationRecord.target_at >= cutoff)
+                        .join(
+                            SignalRecord, SignalEvaluationRecord.signal_id == SignalRecord.signal_id
+                        )
+                        .where(SignalRecord.occurred_at >= cutoff, current_engine)
                         .group_by(SignalEvaluationRecord.status)
                     )
                 ).all()
@@ -503,7 +557,10 @@ def create_app(
                             func.count(),
                             func.avg(SignalEvaluationRecord.return_percent),
                         )
-                        .where(SignalEvaluationRecord.target_at >= cutoff)
+                        .join(
+                            SignalRecord, SignalEvaluationRecord.signal_id == SignalRecord.signal_id
+                        )
+                        .where(SignalRecord.occurred_at >= cutoff, current_engine)
                         .group_by(
                             SignalEvaluationRecord.horizon_minutes,
                             SignalEvaluationRecord.status,
@@ -525,6 +582,12 @@ def create_app(
                     .select_from(TradeRecord)
                     .where(TradeRecord.occurred_at >= cutoff)
                 )
+            outcome_report = await db.evaluation_report(
+                since=cutoff, engine_version="market-anomaly-v1"
+            )
+            market_quality = await _market_summaries(
+                db, request.app.state.settings, datetime.now(UTC)
+            )
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Analytics are temporarily unavailable") from exc
 
@@ -546,6 +609,9 @@ def create_app(
         start_day = today - timedelta(days=days - 1)
         return {
             "period_days": days,
+            "market_quality": market_quality,
+            "excluded_legacy_signals": (all_signals or 0) - sum(count for _, count in by_category),
+            "outcomes_by_pair": [_public_outcome(row) for row in outcome_report],
             "signals_by_category": [
                 {"category": key, "count": count} for key, count in by_category
             ],
@@ -579,6 +645,7 @@ def create_app(
                 "evaluations": total_evaluations,
                 "measured_evaluations": measured_count,
                 "missing_evaluations": missing_count,
+                "pending_evaluations": counts.get("pending", 0),
                 "missing_observation_evaluations": counts.get("missing_observation", 0),
                 "missing_observation_rate_percent": _decimal(
                     Decimal(counts.get("missing_observation", 0))
@@ -596,14 +663,39 @@ def create_app(
 async def _market_summaries(
     database: Database, settings: Settings, now: datetime
 ) -> list[dict[str, object]]:
-    return [
-        await _market_summary(database, pair.key, _stale_after(settings), now)
-        for pair in settings.monitored_pairs
-    ]
+    items = []
+    for pair in settings.monitored_pairs:
+        summary = await _market_summary(database, pair.key, settings, now)
+        summary["tier"] = next(
+            (entry.tier for entry in settings.watchlist if entry.pair == pair), None
+        )
+        summary["enabled"] = True
+        items.append(summary)
+    return items
+
+
+def _public_outcome(row: dict[str, object]) -> dict[str, object]:
+    result = dict(row)
+    sample_count = row.get("measured")
+    for key in (
+        "mean_observed_change_percent",
+        "median_observed_change_percent",
+        "positive_percent",
+        "negative_percent",
+        "mean_max_observed_increase_percent",
+        "mean_max_observed_decrease_percent",
+    ):
+        value = row.get(key)
+        result[key] = (
+            _decimal(value)
+            if isinstance(sample_count, int) and sample_count >= 10 and isinstance(value, Decimal)
+            else None
+        )
+    return result
 
 
 async def _market_summary(
-    database: Database, pair_key: str, stale_after: timedelta, now: datetime
+    database: Database, pair_key: str, settings: Settings, now: datetime
 ) -> dict[str, object]:
     async with database.sessions() as session:
         latest = await session.scalar(
@@ -624,9 +716,16 @@ async def _market_summary(
             .order_by(MarketSnapshotRecord.observed_at)
             .limit(1)
         )
-        volume = await session.scalar(
-            select(func.sum(TradeRecord.base_amount)).where(
+        volume, trade_count = (
+            await session.execute(
+                select(func.sum(TradeRecord.base_amount), func.count()).where(
                 TradeRecord.pair_key == pair_key, TradeRecord.occurred_at >= cutoff
+            )
+            )
+        ).one()
+        snapshot_count = await session.scalar(
+            select(func.count()).select_from(MarketSnapshotRecord).where(
+                MarketSnapshotRecord.pair_key == pair_key
             )
         )
         latest_trade = await session.scalar(
@@ -639,23 +738,140 @@ async def _market_summary(
     first_price = _mid(first) if first else None
     changed = (
         (latest_price / first_price - Decimal(1)) * Decimal(100)
-        if latest_price is not None and first_price is not None and first_price > 0
+        if latest_price is not None
+        and first_price is not None
+        and first_price > 0
+        and first is not None
+        and _as_utc(first.observed_at) <= cutoff + _stale_after(settings)
         else None
     )
     observed_at = _as_utc(latest.observed_at) if latest else None
-    is_stale = observed_at is None or now - observed_at > stale_after
+    is_stale = observed_at is None or now - observed_at > _stale_after(settings)
+    last_trade_scan = trade_watermark(latest.observed_facts) if latest else None
+    trade_scan_status = (
+        "unverified"
+        if last_trade_scan is None
+        else "current"
+        if not is_stale and timedelta(0) <= now - last_trade_scan <= timedelta(minutes=2)
+        else "stale"
+    )
+    valid_book = (
+        latest_price is not None
+        and not is_stale
+        and any(pair.key == pair_key for pair in settings.monitored_pairs)
+    )
+    readiness: dict[str, bool] = {}
+    volume_ready = False
+    large_trade_ready = False
+    if (
+        valid_book
+        and observed_at is not None
+        and timedelta(0) <= now - observed_at <= timedelta(minutes=2)
+    ):
+        rows = await database.book_observations(
+            MarketPair.parse(pair_key),
+            observed_at - timedelta(
+                minutes=max(
+                    60, max(settings.price_windows_minutes) * 4,
+                    (settings.volume_baseline_samples + 2) * 5,
+                )
+            ),
+            observed_at,
+        )
+        books = [
+            BookObservation(
+                _as_utc(row.observed_at), row.best_bid, row.best_ask,
+                trade_watermark(row.observed_facts),
+            )
+            for row in rows
+            if row.best_bid is not None and row.best_ask is not None
+        ]
+        readiness = market_readiness(books, observed_at, settings.price_windows_minutes)
+        coverage = volume_coverage(books, observed_at, settings.volume_baseline_samples)
+        if coverage is not None:
+            volumes = await database.volume_windows(MarketPair.parse(pair_key), *coverage)
+            volume_ready = sum(
+                (value for start, value in volumes.items()
+                 if start < coverage[1] - timedelta(minutes=5)),
+                Decimal(0),
+            ) > 0
+        trade_coverage = volume_coverage(books, observed_at, 12)
+        if trade_coverage is not None and MarketPair.parse(pair_key).base.code is None:
+            trades = await database.trades_with_events(
+                MarketPair.parse(pair_key), observed_at - timedelta(hours=1), observed_at
+            )
+            large_trade_ready = any(
+                sum(source.attributes.get("trade_type") == venue for _, source in trades)
+                >= LARGE_TRADE_MIN_SAMPLES
+                for venue in ("orderbook", "liquidity_pool")
+            )
     return {
         "pair": pair_key,
-        "status": "no_data" if latest is None else "stale" if is_stale else "fresh",
+        "status": (
+            "no_data"
+            if latest is None
+            else "stale"
+            if is_stale
+            else "no_data"
+            if latest_price is None
+            else "fresh"
+        ),
         "latest_price": _decimal(latest_price),
         "price_change_24h_percent": _decimal(changed),
         "volume_24h_base": _decimal(volume),
-        "last_trade_price": _decimal(latest_trade.price) if latest_trade else None,
+        "trade_count_24h": trade_count if trade_count else None,
+        "snapshot_count": snapshot_count,
+        "trade_ingestion_status": trade_scan_status,
+        "last_trade_scan_through": _iso(last_trade_scan) if last_trade_scan else None,
+        "readiness": {
+            "unusual_volume": {
+                "ready": volume_ready,
+                "requirement": (
+                    f"{settings.volume_baseline_samples} prior complete five-minute windows, "
+                    "positive mean, and continuous cursor-based trade scans with fresh "
+                    "Horizon ledger watermarks."
+                ),
+            },
+            "spread_anomaly": {
+                "ready": readiness.get("spread_anomaly", False),
+                "requirement": "Fresh two-sided book and 20 samples over a continuous hour.",
+            },
+            **{
+                f"price_{minutes}m": {
+                    "ready": readiness.get(f"price_{minutes}m", False),
+                    "requirement": (
+                        f"Four continuous {minutes}-minute windows with at least three "
+                        "valid prices at each end; gaps at most two minutes."
+                    ),
+                }
+                for minutes in settings.price_windows_minutes
+            },
+            "liquidity_change": {
+                "ready": False,
+                "requirement": (
+                    "Not implemented: top-20 snapshots do not cover a fixed price range."
+                ),
+            },
+            "large_trade": {
+                "ready": large_trade_ready,
+                "requirement": (
+                    "At least 100 same-venue trades in a continuously covered hour; "
+                    "a fresh trade must also exceed the XLM floor and 10 times the "
+                    "pair/venue median quote notional."
+                ),
+            },
+        },
+        "last_trade_price": (
+            _decimal(latest_trade.price)
+            if latest_trade and latest_trade.quote_amount > 0 else None
+        ),
         "last_trade_at": _iso(_as_utc(latest_trade.occurred_at)) if latest_trade else None,
         "best_bid": _decimal(latest.best_bid) if latest else None,
         "best_ask": _decimal(latest.best_ask) if latest else None,
         "spread_percent": _decimal(latest.spread_percent) if latest else None,
-        "bid_depth": _decimal(latest.bid_depth) if latest else None,
+        "bid_depth": _decimal(latest.bid_depth)
+        if latest and latest.observed_facts.get("bid_depth_units") == "base"
+        else None,
         "ask_depth": _decimal(latest.ask_depth) if latest else None,
         "last_observed_at": _iso(observed_at) if observed_at else None,
     }
@@ -696,9 +912,18 @@ def _event_source(row: EventRecord) -> dict[str, object]:
         and parsed_source.password is None
         else None
     )
+    if (
+        safe_source_ref is None
+        and parsed_source.scheme == "https"
+        and parsed_source.hostname == "horizon.stellar.org"
+        and parsed_source.username is None
+        and parsed_source.password is None
+        and re.fullmatch(r"/(?:trades|operations)/[A-Za-z0-9-]+", parsed_source.path)
+    ):
+        safe_source_ref = urlunsplit(("https", "horizon.stellar.org", parsed_source.path, "", ""))
     tx_match = (
         re.fullmatch(r"/explorer/public/tx/([A-Fa-f0-9]{64})", parsed_source.path)
-        if safe_source_ref
+        if safe_source_ref and parsed_source.hostname == "stellar.expert"
         else None
     )
     return {

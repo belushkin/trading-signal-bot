@@ -104,7 +104,9 @@ export default function App() {
     async (signal?: AbortSignal) => {
       try {
         const [result, health] = await Promise.all([
-          get<Data>(route, signal),
+          route === "/api/markets"
+            ? get<{ items: Market[] }>(route, signal).then((response) => response.items)
+            : get<Data>(route, signal),
           get<{ refresh_seconds: number }>("/api/health", signal),
         ]);
         if (signal?.aborted) return;
@@ -291,7 +293,7 @@ function OverviewPage({ data, onSignal, onPair, onSignals }: { data: Overview; o
       </div>
       <section className="section-block">
         <SectionHeading title="Monitored markets" detail="Latest persisted order-book observations" />
-        {data.markets.length ? <MarketTable markets={data.markets} onPair={onPair} /> : <EmptyState title="No markets configured" detail="Set BOT_MONITORED_PAIRS in your environment to begin collecting market observations." compact />}
+        {data.markets.length ? <MarketTable markets={data.markets} onPair={onPair} /> : <EmptyState title="No markets configured" detail="Set BOT_WATCHLIST_ENABLED or BOT_MONITORED_PAIRS to begin collecting market observations." compact />}
       </section>
       <section className="section-block">
         <SectionHeading title="Recent signal activity" detail="Latest persisted rule matches" linkText="All signals" onLink={onSignals} />
@@ -309,17 +311,17 @@ function MarketsPage({ data, onPair }: { data: Market[]; onPair: (pair: string) 
         <div className="market-grid">
           {data.map((market) => (
             <button className="market-card" key={market.pair} onClick={() => onPair(market.pair)}>
-              <div className="market-card-head"><span className="pair-name">{shortPair(market.pair)}</span><Freshness status={market.status} timestamp={market.last_observed_at} /></div>
-              <div className="market-price">{formatNumber(market.latest_price)} <small>quote / base</small></div>
+              <div className="market-card-head"><span className="pair-name">{shortPair(market.pair)} {market.tier ? `· Tier ${market.tier}` : ""}</span>{market.enabled === false ? <span>Disabled</span> : <Freshness status={market.status} timestamp={market.last_observed_at} />}</div>
+              <div className="market-price">{formatNumber(market.last_trade_price)} <small>last trade · quote / base</small></div>
               <div className={`market-change ${changeTone(market.price_change_24h_percent)}`}>
                 {market.price_change_24h_percent === null ? "N/A" : `${Number(market.price_change_24h_percent) > 0 ? "+" : ""}${formatNumber(market.price_change_24h_percent)}%`}
                 <small>24h observed change</small>
               </div>
-              <div className="market-card-foot"><span>24h volume <strong>{formatNumber(market.volume_24h_base)}</strong></span><ChevronDown size={16} /></div>
+              <div className="market-card-foot"><span>Observed 24h volume <strong>{formatNumber(market.volume_24h_base)}</strong> · {market.trade_count_24h ?? "N/A"} trades</span><ChevronDown size={16} /></div>
             </button>
           ))}
         </div>
-      ) : <EmptyState title="No markets are being monitored" detail="No pair configuration was found. Set BOT_MONITORED_PAIRS and restart the app to collect market data." />}
+      ) : <EmptyState title="No markets are being monitored" detail="Enable watchlist entries or set BOT_MONITORED_PAIRS and restart the app." />}
       <section className="section-block">
         <SectionHeading title="Market observations" detail="No interpolation; metrics reflect actual persisted snapshots." />
         {data.length ? <MarketTable markets={data} onPair={onPair} /> : null}
@@ -353,7 +355,7 @@ function SignalsPage(props: {
         <label className="search-field"><Search size={16} /><input placeholder="Search category, interpretation, transaction, or ID" value={props.searchText} onChange={(event) => props.setSearchText(event.target.value)} /><button type="submit" className="sr-only">Search</button></label>
         <input aria-label="Asset or trading pair" className="filter-input" placeholder="Asset / pair" value={props.pairDraft} onChange={(event) => props.setPairDraft(event.target.value)} />
         <select aria-label="Signal category" value={props.category} onChange={(event) => props.setCategory(event.target.value)}>
-          <option value="">All categories</option><option value="whale_transfer">Large transfer</option><option value="unusual_volume">Unusual volume</option><option value="visible_liquidity">Visible liquidity</option><option value="wide_spread">Wide spread</option>
+          <option value="">All categories</option><option value="price_movement">Price movement</option><option value="volume_anomaly">Volume anomaly</option><option value="spread_anomaly">Spread anomaly</option><option value="large_trade">Large trade</option><option value="whale_transfer">Large transfer</option><option value="unusual_volume">Legacy unusual volume</option><option value="visible_liquidity">Legacy visible liquidity</option><option value="wide_spread">Legacy wide spread</option>
         </select>
         <select aria-label="Severity" value={props.severity} onChange={(event) => props.setSeverity(event.target.value)}>
           <option value="">All severities</option><option>INFO</option><option>WATCH</option><option>HIGH</option><option>CRITICAL</option>
@@ -401,11 +403,11 @@ function ActivityPage(props: {
 function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number; setDays: (value: number) => void }) {
   return (
     <>
-      <PageHeading eyebrow="OBSERVATION QUALITY" title="Analytics" detail="Descriptive counts and forward-price observations. No profitability or directional-accuracy claims." action={<PeriodSelect days={days} setDays={setDays} />} />
+      <PageHeading eyebrow="OBSERVATION QUALITY" title="Analytics" detail="Current engine signals only. Historical signals are excluded; observed changes are not profitability or directional accuracy." action={<PeriodSelect days={days} setDays={setDays} />} />
       <div className="metric-grid analytics-metrics">
         <MetricCard title="Events in period" value={formatInteger(data.data_coverage.events)} detail="Persisted chain events" icon={<Database size={17} />} />
         <MetricCard title="Order-book snapshots" value={formatInteger(data.data_coverage.market_snapshots)} detail="Actual recorded observations" icon={<Waves size={17} />} />
-        <MetricCard title="Measured evaluations" value={formatInteger(data.data_coverage.measured_evaluations)} detail={`${formatInteger(data.data_coverage.missing_evaluations)} missing observations`} icon={<ActivityIcon size={17} />} />
+        <MetricCard title="Measured evaluations" value={formatInteger(data.data_coverage.measured_evaluations)} detail={`${formatInteger(data.data_coverage.missing_evaluations)} missing · ${formatInteger(data.data_coverage.pending_evaluations)} pending`} icon={<ActivityIcon size={17} />} />
         <MetricCard title="Missing rate" value={data.data_coverage.missing_observation_rate_percent === null ? "N/A" : `${formatNumber(data.data_coverage.missing_observation_rate_percent)}%`} detail="Of persisted signal evaluation horizons" icon={<AlertTriangle size={17} />} />
       </div>
       <div className="chart-grid">
@@ -424,6 +426,18 @@ function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number;
         </div>
       </section>
       <section className="section-block">
+        <SectionHeading title="Market data quality" detail="Trade rules need continuous watermarked scans; older observations do not establish ingestion coverage." />
+        {data.market_quality.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Snapshot freshness</th><th>Last observed</th><th>Trade scan watermark</th><th>Baseline readiness</th></tr></thead><tbody>
+          {data.market_quality.map((market) => <tr key={market.pair}><td>{shortPair(market.pair)}</td><td><Freshness status={market.status} timestamp={market.last_observed_at} /></td><td>{market.last_observed_at ? relativeTime(market.last_observed_at) : "N/A"}</td><td>{market.trade_ingestion_status ?? "unverified"}{market.last_trade_scan_through ? ` · ${relativeTime(market.last_trade_scan_through)}` : ""}</td><td>{Object.entries(market.readiness ?? {}).filter(([name]) => name === "spread_anomaly" || name === "unusual_volume" || name === "large_trade" || name.startsWith("price_")).map(([name, value]) => `${name.replaceAll("_", " ")}: ${value.ready ? "ready" : "insufficient"}`).join(" · ") || "N/A"}</td></tr>)}
+        </tbody></table></div> : <EmptyState title="No monitored markets" detail="Enable a configured watchlist market to inspect data quality." compact />}
+      </section>
+      <section className="section-block">
+        <SectionHeading title="Outcomes by market and signal" detail={`${data.excluded_legacy_signals} legacy signals excluded, including signals generated before depth-unit corrections. Statistics require 10 measured observations.`} />
+        {data.outcomes_by_pair.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Signal</th><th>Horizon</th><th>Signals</th><th>Measured / missing / pending</th><th>Mean / median change</th><th>Positive / negative</th></tr></thead><tbody>
+          {data.outcomes_by_pair.map((item) => <tr key={`${item.pair}-${item.category}-${item.severity}-${item.horizon_minutes}`}><td>{shortPair(item.pair)}</td><td>{categoryLabel(item.category)} · {item.severity}</td><td>{formatHorizon(item.horizon_minutes)}</td><td>{item.signals}</td><td>{item.measured} / {item.missing} / {item.pending}</td><td>{item.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(item.mean_observed_change_percent)}% / ${formatNumber(item.median_observed_change_percent)}%`}</td><td>{item.positive_percent === null ? "N/A" : `${formatNumber(item.positive_percent)}% / ${formatNumber(item.negative_percent)}%`}</td></tr>)}
+        </tbody></table></div> : <EmptyState title="No current-engine signal outcomes" detail="Legacy signals are retained but are not compared with the current engine." compact />}
+      </section>
+      <section className="section-block">
         <SectionHeading title="Signals by severity" detail="No sample-size adjustment" />
         <div className="severity-grid">{data.signals_by_severity.length ? data.signals_by_severity.map(({ severity, count }) => <div className="panel severity-count" key={severity}><SeverityBadge value={severity} /><strong>{count}</strong></div>) : <EmptyState title="No signal counts in this period" detail="Signals appear after persisted observations meet configured rules." compact />}</div>
       </section>
@@ -433,8 +447,8 @@ function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number;
 
 function MarketTable({ markets, onPair }: { markets: Market[]; onPair: (pair: string) => void }) {
   return (
-    <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Status</th><th>Latest price</th><th>24h change</th><th>24h volume</th><th>Best bid / ask</th><th>Spread</th><th>Last observation</th></tr></thead>
-      <tbody>{markets.map((item) => <tr key={item.pair} className="clickable-row" onClick={() => onPair(item.pair)}><td className="strong-cell">{shortPair(item.pair)}</td><td><Freshness status={item.status} timestamp={item.last_observed_at} /></td><td>{formatNumber(item.latest_price)}</td><td className={changeTone(item.price_change_24h_percent)}>{item.price_change_24h_percent === null ? "N/A" : `${formatNumber(item.price_change_24h_percent)}%`}</td><td>{formatNumber(item.volume_24h_base)}</td><td>{formatNumber(item.best_bid)} <span className="muted">/</span> {formatNumber(item.best_ask)}</td><td>{item.spread_percent === null ? "N/A" : `${formatNumber(item.spread_percent)}%`}</td><td>{item.last_observed_at ? relativeTime(item.last_observed_at) : "N/A"}</td></tr>)}</tbody>
+    <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Tier</th><th>Status</th><th>Last trade price</th><th>24h change</th><th>Observed 24h volume</th><th>Trades</th><th>Best bid / ask</th><th>Spread</th><th>Bid / ask depth</th><th>Last observation</th></tr></thead>
+    <tbody>{markets.map((item) => <tr key={item.pair} className="clickable-row" onClick={() => onPair(item.pair)}><td className="strong-cell">{shortPair(item.pair)}</td><td>{item.tier ?? "N/A"}</td><td>{item.enabled === false ? "Disabled" : <Freshness status={item.status} timestamp={item.last_observed_at} />}</td><td>{formatNumber(item.last_trade_price)}</td><td className={changeTone(item.price_change_24h_percent)}>{item.price_change_24h_percent === null ? "N/A" : `${formatNumber(item.price_change_24h_percent)}%`}</td><td>{formatNumber(item.volume_24h_base)}</td><td>{item.trade_count_24h ?? "N/A"}</td><td>{formatNumber(item.best_bid)} <span className="muted">/</span> {formatNumber(item.best_ask)}</td><td>{item.spread_percent === null ? "N/A" : `${formatNumber(item.spread_percent)}%`}</td><td>{formatNumber(item.bid_depth)} / {formatNumber(item.ask_depth)}</td><td>{item.last_observed_at ? relativeTime(item.last_observed_at) : "N/A"}</td></tr>)}</tbody>
     </table></div>
   );
 }
@@ -481,10 +495,10 @@ function SignalDialog({ id, onClose }: { id: string; onClose: () => void }) {
       {loading ? <LoadingState compact /> : error ? <ErrorState message={error} /> : detail ? (
         <>
           <div className="detail-title"><div><div className="eyebrow">{categoryLabel(detail.category)}</div><h2>{shortPair(detail.pair ?? detail.asset ?? "Signal")}</h2></div><SeverityBadge value={detail.severity} /></div>
-          <div className="detail-facts"><DetailField label="Timestamp" value={formatDateTime(detail.occurred_at)} /><DetailField label="Confidence" value={detail.confidence} /><DetailField label="Expires" value={formatDateTime(detail.expires_at)} /><DetailField label="Source event" value={detail.source?.event_id ?? "N/A"} /></div>
+          <div className="detail-facts"><DetailField label="Timestamp" value={formatDateTime(detail.occurred_at)} /><DetailField label="Confidence" value={detail.confidence} /><DetailField label="Expires" value={formatDateTime(detail.expires_at)} /><DetailField label="Source event" value={detail.source?.event_id ?? "N/A"} /><DetailField label="Deduplication key" value={detail.deduplication_key} /></div>
           <div className="fact-block"><div className="fact-heading"><span className="fact-dot" />Observed facts <small>Persisted measurements</small></div><pre>{JSON.stringify(detail.observed_facts, null, 2)}</pre></div>
           <div className="fact-block interpretation-block"><div className="fact-heading"><span className="interpret-dot" />Interpretation <small>Rule-generated explanation</small></div><p>{detail.interpretation}</p></div>
-          {detail.source?.explorer_url && <a className="button button-secondary explorer-button" href={detail.source.explorer_url} target="_blank" rel="noreferrer">View Stellar transaction <ExternalLink size={14} /></a>}
+          {detail.source?.explorer_url ? <a className="button button-secondary explorer-button" href={detail.source.explorer_url} target="_blank" rel="noreferrer">View Stellar transaction <ExternalLink size={14} /></a> : detail.source?.source_ref && <a className="button button-secondary explorer-button" href={detail.source.source_ref} target="_blank" rel="noreferrer">View source event <ExternalLink size={14} /></a>}
           <div className="section-block"><SectionHeading title="Subsequent price evaluation" detail="Observed price changes are not trading performance." />
             {detail.evaluations.length ? <div className="evaluation-list">{detail.evaluations.map((evaluation) => <div className="evaluation-row" key={evaluation.horizon_minutes}><strong>{formatHorizon(evaluation.horizon_minutes)}</strong><span>{evaluation.status === "measured" ? `${formatNumber(evaluation.observed_change_percent)}%` : evaluation.status.replaceAll("_", " ")}</span><small>{evaluation.measured_at ? formatDateTime(evaluation.measured_at) : `Expected ${formatDateTime(evaluation.target_at)}`}</small><small>{evaluation.data_quality} · {evaluation.observation_count} observations</small></div>)}</div> : <EmptyState title="No evaluation horizons" detail="This signal has no associated price-evaluation record." compact />}
           </div>
@@ -509,8 +523,11 @@ function MarketDialog({ pair, onClose, onSignal }: { pair: string; onClose: () =
     <Dialog title="Market detail" onClose={onClose} wide>
       <div className="detail-title"><div><div className="eyebrow">MONITORED MARKET</div><h2>{shortPair(pair)}</h2></div><button className="button button-secondary" onClick={onSignal}>View signals</button></div>
       {error ? <ErrorState message={error} /> : !detail ? <LoadingState compact /> : <>
+        <p>{detail.data_source}. Trade volume is observed only and may include order-book and AMM trades; it may be incomplete.</p>
+        <p><code>{detail.pair}</code> · {detail.summary.enabled === false ? "Disabled" : `Tier ${detail.summary.tier ?? "N/A"}`} · {detail.summary.snapshot_count ?? 0} persisted snapshots</p>
         <div className="market-detail-stats">
-          <DetailField label="Latest price" value={formatNumber(detail.summary.latest_price)} />
+          <DetailField label="Last trade price" value={formatNumber(detail.summary.last_trade_price)} />
+          <DetailField label="Last trade time" value={detail.summary.last_trade_at ? formatDateTime(detail.summary.last_trade_at) : "N/A"} />
           <DetailField label="24h change" value={detail.summary.price_change_24h_percent === null ? "N/A" : `${formatNumber(detail.summary.price_change_24h_percent)}%`} />
           <DetailField label="24h base volume" value={formatNumber(detail.summary.volume_24h_base)} />
           <DetailField label="Best bid / ask" value={`${formatNumber(detail.summary.best_bid)} / ${formatNumber(detail.summary.best_ask)}`} />
@@ -521,6 +538,15 @@ function MarketDialog({ pair, onClose, onSignal }: { pair: string; onClose: () =
         {detail.history.some((item) => item.price !== null) ? <div className="market-chart"><ResponsiveContainer width="100%" height={270}><ScatterChart><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="observed_at" type="category" tickFormatter={formatAxisTime} minTickGap={45} /><YAxis dataKey="price" type="number" domain={["auto", "auto"]} width={62} /><Tooltip labelFormatter={(value) => formatDateTime(String(value))} /><Scatter name="Observed midpoint" data={detail.history.filter((item) => item.price !== null).map((item) => ({ ...item, price: Number(item.price) }))} dataKey="price" fill="var(--accent)" shape="circle" /></ScatterChart></ResponsiveContainer></div> : <ChartEmpty message="No valid two-sided order-book observations in this period." />}
         <div className="chart-toolbar"><div><h3>Observed base volume</h3><span>15-minute buckets from persisted trades only; empty intervals are omitted, not filled with zero.</span></div></div>
         {detail.volume_history.length ? <ResponsiveContainer width="100%" height={210}><BarChart data={detail.volume_history.map((item) => ({ ...item, base_volume: Number(item.base_volume) }))}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="observed_at" tickFormatter={formatAxisTime} minTickGap={45} /><YAxis width={62} /><Tooltip labelFormatter={(value) => formatDateTime(String(value))} /><Bar dataKey="base_volume" fill="var(--blue)" /></BarChart></ResponsiveContainer> : <ChartEmpty message="No trade-volume observations in this period." />}
+        <div className="section-block"><SectionHeading title="Signal readiness" detail="Data sufficiency is not signal quality or profitability." />
+          {Object.entries(detail.summary.readiness ?? {}).map(([name, value]) => <p key={name}><strong>{name.replaceAll("_", " ")}: {detail.summary.enabled === false ? "disabled" : value.ready ? "data available" : "not ready"}</strong> — {value.requirement}</p>)}
+        </div>
+        <div className="section-block"><SectionHeading title="Recent trades" detail="Persisted Horizon trades; source type may be order book or AMM." />
+          {detail.recent_trades?.length ? detail.recent_trades.map((trade, index) => <p key={`${trade.occurred_at}-${index}`}>{formatDateTime(trade.occurred_at)} · {formatNumber(trade.base_amount)} base · {formatNumber(trade.price)} quote/base · {trade.trade_type ?? "type unknown"}</p>) : <p>No persisted trades.</p>}
+        </div>
+        <div className="section-block"><SectionHeading title="Recent order-book snapshots" detail="Observed best prices, spread and depth; no reconstruction." />
+          {detail.history.length ? detail.history.slice(-10).reverse().map((item, index) => <p key={`${item.observed_at}-${index}`}>{formatDateTime(item.observed_at)} · bid {formatNumber(item.best_bid)} · ask {formatNumber(item.best_ask)} · spread {formatNumber(item.spread_percent)}% · depth {formatNumber(item.bid_depth)} / {formatNumber(item.ask_depth)}</p>) : <p>No persisted snapshots.</p>}
+        </div>
       </>}
     </Dialog>
   );

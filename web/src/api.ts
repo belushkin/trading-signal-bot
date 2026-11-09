@@ -1,9 +1,16 @@
 export type Market = {
   pair: string;
+  tier?: number | null;
+  enabled?: boolean;
   status: "fresh" | "stale" | "no_data";
   latest_price: string | null;
   price_change_24h_percent: string | null;
   volume_24h_base: string | null;
+  trade_count_24h?: number | null;
+  snapshot_count?: number | null;
+  trade_ingestion_status?: "current" | "stale" | "unverified";
+  last_trade_scan_through?: string | null;
+  readiness?: Record<string, { ready: boolean; requirement: string }>;
   last_trade_price: string | null;
   last_trade_at: string | null;
   best_bid: string | null;
@@ -50,10 +57,11 @@ export type SignalDetail = Signal & {
   observed_facts: Record<string, unknown>;
   interpretation: string;
   expires_at: string;
+  deduplication_key: string;
   source: {
     event_id: string;
     occurred_at: string;
-    source_ref: string;
+    source_ref: string | null;
     explorer_url: string | null;
   } | null;
   evaluations: {
@@ -83,14 +91,32 @@ export type Activity = {
 export type MarketDetail = {
   pair: string;
   summary: Market;
-  history: { observed_at: string; price: string | null; bid_depth: string; ask_depth: string }[];
+  history: { observed_at: string; price: string | null; bid_depth: string | null; ask_depth: string; best_bid: string | null; best_ask: string | null; spread_percent: string | null }[];
   volume_history: { observed_at: string; base_volume: string }[];
+  recent_trades: { occurred_at: string; price: string | null; base_amount: string; quote_amount: string; trade_type: string | null }[];
+  data_source: string;
   history_hours: number;
   truncated: boolean;
 };
 
 export type Analytics = {
   period_days: number;
+  market_quality: Market[];
+  excluded_legacy_signals: number;
+  outcomes_by_pair: {
+    pair: string;
+    category: string;
+    severity: string;
+    horizon_minutes: number;
+    signals: number;
+    measured: number;
+    missing: number;
+    pending: number;
+    mean_observed_change_percent: string | null;
+    median_observed_change_percent: string | null;
+    positive_percent: string | null;
+    negative_percent: string | null;
+  }[];
   signals_by_category: { category: string; count: number }[];
   signals_by_severity: { severity: string; count: number }[];
   signal_frequency: { date: string; count: number }[];
@@ -101,6 +127,7 @@ export type Analytics = {
     evaluations: number;
     measured_evaluations: number;
     missing_evaluations: number;
+    pending_evaluations: number;
     missing_observation_rate_percent: string | null;
   };
   price_evaluations: {
