@@ -30,6 +30,26 @@ export type Signal = {
   pair: string | null;
   asset: string | null;
   interpretation: string;
+  expires_at?: string;
+  observed_facts?: Record<string, unknown>;
+  evaluations?: SignalEvaluation[];
+};
+
+export type SignalEvaluation = {
+  horizon_minutes: number;
+  target_at: string;
+  reference_price: string | null;
+  measured_price: string | null;
+  measured_at: string | null;
+  observed_change_percent: string | null;
+  status: string;
+  data_quality: string;
+  observation_count: number;
+  largest_gap_seconds: number | null;
+  price_basis?: string | null;
+  observation_ref?: string | null;
+  reference_observed_at?: string | null;
+  missing_reason?: string | null;
 };
 
 export type PageResult<T> = { items: T[]; total: number; limit: number; offset: number };
@@ -48,7 +68,7 @@ export type Overview = {
     last_skipped_reason?: string | null;
   };
   database: { status: string };
-  counts: { events: number; signals: number };
+  counts: { events: number; signals: number; notable_events_24h?: number };
   last_event_at: string | null;
   last_signal_at: string | null;
   data_freshness_seconds: number | null;
@@ -70,22 +90,7 @@ export type SignalDetail = Signal & {
     source_ref: string | null;
     explorer_url: string | null;
   } | null;
-  evaluations: {
-    horizon_minutes: number;
-    target_at: string;
-    reference_price: string | null;
-    measured_price: string | null;
-    measured_at: string | null;
-    observed_change_percent: string | null;
-    status: string;
-    data_quality: string;
-    observation_count: number;
-    largest_gap_seconds: number | null;
-    price_basis?: string | null;
-    observation_ref?: string | null;
-    reference_observed_at?: string | null;
-    missing_reason?: string | null;
-  }[];
+  evaluations: SignalEvaluation[];
   volume_evidence?: VolumeEvidence | null;
   account_diagnostics_available?: boolean;
 };

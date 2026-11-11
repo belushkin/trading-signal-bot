@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import os
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Sequence
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
@@ -167,6 +167,14 @@ def create_app(
                 latest_event_at = await session.scalar(select(func.max(EventRecord.occurred_at)))
                 latest_signal_at = await session.scalar(select(func.max(SignalRecord.occurred_at)))
                 runtime = await session.get(RuntimeHealthRecord, "collector")
+                notable_events_24h = await session.scalar(
+                    select(func.count())
+                    .select_from(SignalRecord)
+                    .where(
+                        SignalRecord.occurred_at >= now - timedelta(hours=24),
+                        SignalRecord.severity.in_(("WATCH", "HIGH", "CRITICAL")),
+                    )
+                )
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Dashboard data is temporarily unavailable") from exc
 
@@ -215,7 +223,7 @@ def create_app(
 
         try:
             pairs = await _market_summaries(db, config, now)
-            recent_signals = await _recent_signals(db, limit=8)
+            recent_signals = await _recent_signals(db, limit=12)
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Dashboard data is temporarily unavailable") from exc
         return {
@@ -232,7 +240,11 @@ def create_app(
                 "last_skipped_reason": runtime.last_skipped_reason if runtime else None,
             },
             "database": {"status": "healthy"},
-            "counts": {"events": event_count or 0, "signals": signal_count or 0},
+            "counts": {
+                "events": event_count or 0,
+                "signals": signal_count or 0,
+                "notable_events_24h": notable_events_24h or 0,
+            },
             "last_event_at": _iso(_as_utc(latest_event_at)) if latest_event_at else None,
             "last_signal_at": _iso(_as_utc(latest_signal_at)) if latest_signal_at else None,
             "data_freshness_seconds": (
@@ -415,10 +427,11 @@ def create_app(
                         query.order_by(SignalRecord.occurred_at.desc()).limit(limit).offset(offset)
                     )
                 ).all()
+                summaries = await _summaries_with_outcomes(session, rows)
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Signals are temporarily unavailable") from exc
         return {
-            "items": [_signal_summary(row) for row in rows],
+            "items": summaries,
             "total": total or 0,
             "limit": limit,
             "offset": offset,
@@ -937,7 +950,33 @@ async def _recent_signals(database: Database, *, limit: int) -> list[dict[str, o
                 select(SignalRecord).order_by(SignalRecord.occurred_at.desc()).limit(limit)
             )
         ).all()
-    return [_signal_summary(row) for row in rows]
+        return await _summaries_with_outcomes(session, rows)
+
+
+async def _summaries_with_outcomes(
+    session: AsyncSession, rows: Sequence[SignalRecord]
+) -> list[dict[str, object]]:
+    """Summaries plus facts and price evaluations so cards can be explained without extra calls."""
+    by_signal: dict[str, list[dict[str, object]]] = {row.signal_id: [] for row in rows}
+    if by_signal:
+        evaluations = (
+            await session.scalars(
+                select(SignalEvaluationRecord)
+                .where(SignalEvaluationRecord.signal_id.in_(by_signal))
+                .order_by(SignalEvaluationRecord.horizon_minutes)
+            )
+        ).all()
+        for evaluation in evaluations:
+            by_signal[evaluation.signal_id].append(_evaluation(evaluation))
+    return [
+        {
+            **_signal_summary(row),
+            "observed_facts": _safe_facts(row.observed_facts),
+            "expires_at": _iso(_as_utc(row.expires_at)),
+            "evaluations": by_signal[row.signal_id],
+        }
+        for row in rows
+    ]
 
 
 def _signal_summary(row: SignalRecord) -> dict[str, object]:

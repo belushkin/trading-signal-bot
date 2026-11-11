@@ -62,7 +62,7 @@ describe("dashboard request states", () => {
     );
     render(<App />);
     expect(await screen.findByText("No markets configured")).toBeInTheDocument();
-    expect(screen.getByText("No signals yet")).toBeInTheDocument();
+    expect(screen.getByText("No notable events yet")).toBeInTheDocument();
     expect(screen.getByText("No persisted Stellar events yet.")).toBeInTheDocument();
   });
 
@@ -93,7 +93,7 @@ describe("dashboard request states", () => {
       }),
     );
     render(<App />);
-    expect(await screen.findByText("No signals yet")).toBeInTheDocument();
+    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Activity" }));
     expect(await screen.findByText("No recent activity")).toBeInTheDocument();
   });
@@ -139,7 +139,7 @@ describe("dashboard request states", () => {
       };
     }));
     render(<App />);
-    expect(await screen.findByText("No signals yet")).toBeInTheDocument();
+    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Markets" }));
     expect(await screen.findByText(/Tier 2/)).toBeInTheDocument();
     expect(screen.getAllByText("Disabled").length).toBeGreaterThan(0);
@@ -171,7 +171,7 @@ describe("dashboard request states", () => {
         : String(input).includes("/api/analytics") ? analytics : overview,
     })));
     render(<App />);
-    expect(await screen.findByText("No signals yet")).toBeInTheDocument();
+    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
     expect(await screen.findByText(/5 legacy signals excluded/)).toBeInTheDocument();
     expect(screen.getByText("Insufficient sample")).toBeInTheDocument();
@@ -228,7 +228,7 @@ describe("dashboard request states", () => {
           : overview,
     })));
     render(<App />);
-    expect(await screen.findByText("No signals yet")).toBeInTheDocument();
+    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Signals" }));
     await screen.findByText("No signals match these filters");
     const filter = screen.getByLabelText("Signal category");

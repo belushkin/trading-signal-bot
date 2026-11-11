@@ -53,7 +53,7 @@ async def test_empty_database_and_unconfigured_markets_are_explicit(tmp_path) ->
     assert health.status_code == 200
     assert health.json()["database"]["status"] == "healthy"
     assert health.json()["collector"]["status"] == "not_started"
-    assert overview.json()["counts"] == {"events": 0, "signals": 0}
+    assert overview.json()["counts"] == {"events": 0, "signals": 0, "notable_events_24h": 0}
     assert "no_markets_configured" in {item["code"] for item in overview.json()["warnings"]}
     assert markets.json()["items"] == []
     assert "No markets are configured" in markets.json()["message"]
