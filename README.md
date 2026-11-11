@@ -57,6 +57,7 @@ Settings:
 | `BOT_PRICE_WINDOWS_MINUTES` | `5,15,60,240` | Enabled price windows, selected from 5, 15, 60 and 240 minutes |
 | `BOT_LOG_LEVEL` | `INFO` | Standard logging level |
 | `BOT_RETENTION_DAYS` | `30` | Delete observations older than this many days during periodic cleanup |
+| `BOT_ACCOUNT_DIAGNOSTICS` | `false` | Enables the optional `/api/signals/{id}/account-diagnostics` endpoint. Account identities are never part of the default public signal views |
 
 The exact issuer identities and tier defaults are defined once in [watchlist.json](src/stellar_intelligence_bot/app/watchlist.json); see [the market verification record](docs/market-watchlist.md) for sources and limitations. A non-empty `BOT_MONITORED_PAIRS` takes precedence over `BOT_WATCHLIST_ENABLED`; an empty `BOT_MONITORED_PAIRS` alone no longer disables the default watchlist.
 
@@ -97,7 +98,7 @@ mypy src
 
 - Data comes from the configured Horizon endpoint. Availability, rate limits, and historical retention depend on that operator. The client handles pagination, transient 429/5xx/network failures, and retry backoff.
 - When a stream has no saved cursor, collection bootstraps from Horizon's latest page; older history is not backfilled. Cursor advancement and event persistence share a database transaction, and duplicate event IDs are ignored.
-- The volume baseline uses the latest persisted five-minute windows containing trades. Signals remain unavailable until enough baseline windows exist; zero-trade windows are not currently materialized. Horizon trade volume can include order-book and liquidity-pool trades; old stored trades do not identify their type.
+- The volume baseline uses the latest persisted five-minute windows containing trades. Signals remain unavailable until enough baseline windows exist; zero-trade windows are not currently materialized. Horizon trade volume can include order-book and liquidity-pool trades; trades stored before migration `0005` have no venue until the explicit backfill below is run.
 - Prior to the watchlist update, order-book bid amounts were treated as base units rather than quote units. Older bid-depth readings are hidden in the dashboard, but historical signals and evaluations are not recomputed. Earlier snapshots also used rounded Horizon prices.
 - Confidence is qualitative, not a probability: `HIGH` means the signal's measured facts come directly from complete source fields and satisfy a configured rule. It does not imply predictive accuracy.
 - Signal severity is rule-based. A transfer at least ten times its configured threshold is `HIGH`; other configured transfer breaches are `WATCH`. Market anomaly and order-book rules currently emit `WATCH`, except an extreme volume breach (at least three times its configured trigger), which emits `HIGH`.
@@ -108,6 +109,23 @@ mypy src
 Market signals with a pair and a valid two-sided reference snapshot record their midpoint at signal time. The collector evaluates the first valid two-sided order-book midpoint at or after 5 minutes, 15 minutes, 1 hour, 4 hours, and 24 hours. An observation must arrive within five minutes after the target; otherwise the result is recorded as missing rather than substituted with stale data. Evaluation runs continuously with collection, so the service must remain running for later horizons to complete.
 
 Evaluations persist the reference and measured price/time, signed observed percent change, sampled maximum increase/decrease before the target, observation count, largest sample gap, and data-quality status. These are descriptive forward-price observations only—not realized P&L, profitability, or directional accuracy. Sampled extrema are not guaranteed to capture movement between observations. Signals without a suitable market pair/reference price are not evaluated.
+
+### Trade-price fallback
+
+Snapshot mid-price is always preferred. If no valid two-sided snapshot exists within the five-minute grace window after a target, the evaluation may use persisted trade prices instead, labelled `price_basis=trade_price` (snapshot results are `snapshot_mid`). Requirements: a trade inside `[target, target+5 min]`, a reference trade at or before signal time within 15 minutes, and at least three trades spanning reference to measurement. The two bases are never mixed within one evaluation (the reference price is also a trade price), nothing is interpolated, and `missing_reason` records why an evaluation stayed missing (`no_snapshot_and_no_trade_in_grace`, `no_reference_trade_in_lookback`, `insufficient_trade_observations`). Analytics report the two bases in separate rows.
+
+### Trade provenance and explicit backfills
+
+Migration `0005_trade_provenance` adds nullable columns (venue, `base_is_seller`, asset identities, operation id, transaction hash when present, account identities, pool id, observation time). `NULL` means "not recorded"; missing direction or accounts are never inferred. Horizon trade records do not include a transaction hash, and `base_is_seller` is orientation only, not the aggressor side. Two explicit, idempotent commands handle historical rows:
+
+```sh
+python -m stellar_intelligence_bot backfill-trades --since-hours 26   # fills only empty provenance columns of stored trades; never inserts; observed_at stays NULL
+python -m stellar_intelligence_bot reevaluate-missing --dry-run       # preview; omit --dry-run to apply to missing evaluations only
+```
+
+`reevaluate-missing` never changes measured evaluations. Evaluations with `price_basis` empty are legacy snapshot results.
+
+Malformed, zero-base (dust) or otherwise invalid Horizon trades are skipped with a logged reason, counted in collector health (`skipped_trade_count`) and their cursor still advances; consecutive failed cycles are counted as interruptions.
 
 Print grouped summary statistics for the last 30 days:
 

@@ -18,8 +18,13 @@ from sqlalchemy.exc import SQLAlchemyError
 
 from stellar_intelligence_bot.app.config import Settings
 from stellar_intelligence_bot.app.logging_config import configure_logging
-from stellar_intelligence_bot.chains.stellar.client import HorizonClient
-from stellar_intelligence_bot.chains.stellar.collector import StellarCollector
+from stellar_intelligence_bot.chains.stellar.client import MALFORMED_RECORD_KEY, HorizonClient
+from stellar_intelligence_bot.chains.stellar.collector import (
+    StellarCollector,
+    parse_trade,
+    parse_trade_provenance,
+    parse_trade_time,
+)
 from stellar_intelligence_bot.storage.database import Database
 from stellar_intelligence_bot.workers.processor import EventProcessor
 
@@ -118,12 +123,28 @@ def main() -> None:
         choices=(5, 15, 60, 240, 1440),
     )
     subparsers.add_parser("health", help="Check database and collector heartbeat")
+    backfill_parser = subparsers.add_parser(
+        "backfill-trades",
+        help="Fill missing provenance of stored trades from Horizon (never inserts trades)",
+    )
+    backfill_parser.add_argument("--since-hours", type=int, required=True)
+    reevaluate_parser = subparsers.add_parser(
+        "reevaluate-missing",
+        help="Retry missing evaluations with labelled trade prices (explicit backfill)",
+    )
+    reevaluate_parser.add_argument("--dry-run", action="store_true")
     args = parser.parse_args()
     try:
         if args.command == "report":
             if args.since_days <= 0:
                 parser.error("--since-days must be positive")
             asyncio.run(_print_report(args.since_days, args.horizon_minutes))
+        elif args.command == "backfill-trades":
+            if args.since_hours <= 0:
+                parser.error("--since-hours must be positive")
+            asyncio.run(_backfill_trades(args.since_hours))
+        elif args.command == "reevaluate-missing":
+            asyncio.run(_reevaluate_missing(args.dry_run))
         elif args.command == "health":
             asyncio.run(_check_health())
         else:
@@ -142,6 +163,61 @@ async def _print_report(since_days: int, horizon_minutes: int | None) -> None:
             horizon_minutes=horizon_minutes,
         )
         print(json.dumps(rows, indent=2, default=str))
+    finally:
+        await database.close()
+
+
+async def _backfill_trades(since_hours: int) -> None:
+    settings = Settings.from_env()
+    configure_logging(settings.log_level)
+    await asyncio.to_thread(_upgrade_schema, settings.database_url)
+    database = Database(settings.database_url)
+    since = datetime.now(UTC) - timedelta(hours=since_hours)
+    summary: dict[str, dict[str, int]] = {}
+    try:
+        async with HorizonClient(settings.horizon_url) as client:
+            for pair in settings.monitored_pairs:
+                gap = await database.trade_provenance_gaps(pair, since)
+                if gap is None:
+                    summary[pair.key] = {"gaps": 0}
+                    continue
+                first_time, last_time, first_id = gap
+                operation = first_id.removeprefix("stellar:trade:").split("-", maxsplit=1)[0]
+                if not operation.isdigit():
+                    continue
+                cursor = f"{int(operation) - 1}-0"
+                entries = []
+                async for record in client.records(
+                    "trades", cursor=cursor, params=pair.horizon_params()
+                ):
+                    if MALFORMED_RECORD_KEY in record:
+                        continue
+                    try:
+                        _, base, quote = parse_trade(record, pair)
+                        provenance = parse_trade_provenance(record, pair, observed_at=None)
+                        closed_at = parse_trade_time(record)
+                    except (KeyError, ValueError, TypeError, AttributeError, ArithmeticError):
+                        continue
+                    if closed_at > last_time:
+                        break
+                    entries.append((f"stellar:trade:{record['id']}", provenance, base, quote))
+                summary[pair.key] = {
+                    "gaps_from": int(first_time.timestamp()),
+                    "fetched": len(entries),
+                    **await database.apply_trade_provenance(entries),
+                }
+        print(json.dumps(summary, indent=2))
+    finally:
+        await database.close()
+
+
+async def _reevaluate_missing(dry_run: bool) -> None:
+    settings = Settings.from_env()
+    await asyncio.to_thread(_upgrade_schema, settings.database_url)
+    database = Database(settings.database_url)
+    try:
+        counts = await database.reevaluate_missing_with_trades(dry_run=dry_run)
+        print(json.dumps({"dry_run": dry_run, **counts}, indent=2))
     finally:
         await database.close()
 

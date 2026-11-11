@@ -1,5 +1,6 @@
 """Persist collected Stellar observations and evaluate signal rules."""
 
+import logging
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
 
@@ -19,6 +20,8 @@ from stellar_intelligence_bot.core.signal_engine import (
     whale_signal,
 )
 from stellar_intelligence_bot.storage.database import Database
+
+logger = logging.getLogger(__name__)
 
 
 class EventProcessor:
@@ -48,7 +51,11 @@ class EventProcessor:
     async def process(self, item: CollectedEvent) -> None:
         event = item.event
         if event is None:
-            if item.stream_key is not None and item.cursor is not None:
+            if item.skipped_reason is not None:
+                await self.database.record_skipped_trade(
+                    item.skipped_reason, stream_key=item.stream_key, cursor=item.cursor
+                )
+            elif item.stream_key is not None and item.cursor is not None:
                 await self.database.advance_cursor(item.stream_key, item.cursor)
             return
 
@@ -64,14 +71,25 @@ class EventProcessor:
         if event.event_type == "trade":
             if item.pair is None or item.base_amount is None or item.quote_amount is None:
                 raise ValueError("Trade events must include pair and amounts")
-            await self.database.save_trade_event(
-                event,
-                item.stream_key,
-                item.cursor,
-                item.pair,
-                item.base_amount,
-                item.quote_amount,
-            )
+            try:
+                await self.database.save_trade_event(
+                    event,
+                    item.stream_key,
+                    item.cursor,
+                    item.pair,
+                    item.base_amount,
+                    item.quote_amount,
+                    item.provenance,
+                )
+            except ValueError as exc:
+                logger.warning(
+                    "Skipping trade that failed storage validation event_id=%s reason=%s",
+                    event.event_id,
+                    exc,
+                )
+                await self.database.record_skipped_trade(
+                    f"invalid_trade: {exc}"[:300], stream_key=item.stream_key, cursor=item.cursor
+                )
             return
 
         inserted = await self.database.save_event_with_cursor(

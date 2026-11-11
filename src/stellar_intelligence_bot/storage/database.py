@@ -11,6 +11,7 @@ from typing import Any
 from sqlalchemy import delete, desc, func, or_, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
+from stellar_intelligence_bot.chains.base import TradeProvenance
 from stellar_intelligence_bot.core.events import ChainEvent
 from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.core.signals import Signal
@@ -29,6 +30,13 @@ from stellar_intelligence_bot.storage.models import (
 
 EVALUATION_HORIZONS_MINUTES = (5, 15, 60, 240, 1440)
 EVALUATION_OBSERVATION_GRACE = timedelta(minutes=5)
+# Trade-price fallback: used only when no valid order-book snapshot exists within the
+# snapshot grace window. The measured trade must fall in the same grace window, so the
+# fallback never delays a verdict. Prices are never interpolated; each endpoint is a real trade.
+TRADE_REFERENCE_LOOKBACK = timedelta(minutes=15)
+MIN_TRADE_OBSERVATIONS = 3
+PRICE_BASIS_SNAPSHOT = "snapshot_mid"
+PRICE_BASIS_TRADE = "trade_price"
 
 
 class Database:
@@ -78,9 +86,95 @@ class Database:
             if successful:
                 record.last_success_at = recorded_at
                 record.last_error = None
+                record.consecutive_failures = 0
             else:
+                if (record.consecutive_failures or 0) == 0:
+                    record.interruption_count = (record.interruption_count or 0) + 1
+                    record.last_interruption_at = recorded_at
+                record.consecutive_failures = (record.consecutive_failures or 0) + 1
                 record.last_error_at = recorded_at
                 record.last_error = (error or "Unknown collector failure")[:2000]
+
+    async def apply_trade_provenance(
+        self, entries: list[tuple[str, TradeProvenance, Decimal, Decimal]]
+    ) -> dict[str, int]:
+        """Explicit backfill: fill empty provenance columns of already-stored trades.
+
+        Never inserts trades, never overwrites a populated column, and skips records whose
+        amounts differ from the stored trade. Safe to run repeatedly.
+        """
+        counts = {"updated": 0, "already_populated": 0, "not_stored": 0, "amount_mismatch": 0}
+        async with self.sessions.begin() as session:
+            for trade_id, provenance, base_amount, quote_amount in entries:
+                trade = await session.get(TradeRecord, trade_id)
+                if trade is None:
+                    counts["not_stored"] += 1
+                    continue
+                if trade.base_amount != base_amount or trade.quote_amount != quote_amount:
+                    counts["amount_mismatch"] += 1
+                    continue
+                changed = False
+                for column, value in _provenance_columns(provenance).items():
+                    if value is not None and getattr(trade, column) is None:
+                        setattr(trade, column, value)
+                        changed = True
+                counts["updated" if changed else "already_populated"] += 1
+        return counts
+
+    async def trade_provenance_gaps(
+        self, pair: MarketPair, since: datetime
+    ) -> tuple[datetime, datetime, str] | None:
+        """Earliest/latest time and first trade id of stored trades lacking provenance."""
+        async with self.sessions() as session:
+            row = (
+                await session.execute(
+                    select(
+                        func.min(TradeRecord.occurred_at),
+                        func.max(TradeRecord.occurred_at),
+                    ).where(
+                        TradeRecord.pair_key == pair.key,
+                        TradeRecord.venue.is_(None),
+                        TradeRecord.occurred_at >= since,
+                    )
+                )
+            ).one()
+            if row[0] is None:
+                return None
+            first = await session.scalar(
+                select(TradeRecord.trade_id)
+                .where(
+                    TradeRecord.pair_key == pair.key,
+                    TradeRecord.venue.is_(None),
+                    TradeRecord.occurred_at == row[0],
+                )
+                .order_by(TradeRecord.trade_id)
+                .limit(1)
+            )
+        return _as_utc(row[0]), _as_utc(row[1]), str(first)
+
+    async def record_skipped_trade(
+        self,
+        reason: str,
+        *,
+        started_at: datetime | None = None,
+        stream_key: str | None = None,
+        cursor: str | None = None,
+        now: datetime | None = None,
+    ) -> None:
+        """Count a skipped trade and advance its watermark in one transaction."""
+        recorded_at = _as_utc(now or datetime.now(UTC))
+        async with self.sessions.begin() as session:
+            record = await session.get(RuntimeHealthRecord, "collector")
+            if record is None:
+                record = RuntimeHealthRecord(
+                    health_key="collector", started_at=_as_utc(started_at or recorded_at)
+                )
+                session.add(record)
+            record.skipped_trade_count = (record.skipped_trade_count or 0) + 1
+            record.last_skipped_at = recorded_at
+            record.last_skipped_reason = reason[:2000]
+            if stream_key is not None and cursor is not None:
+                await _save_cursor(session, stream_key, cursor)
 
     async def health_status(
         self, *, stale_after: timedelta, now: datetime | None = None
@@ -102,6 +196,9 @@ class Database:
             "last_success_at": last_success,
             "last_error_at": _as_utc(record.last_error_at) if record.last_error_at else None,
             "last_error": record.last_error,
+            "consecutive_failures": record.consecutive_failures or 0,
+            "interruption_count": record.interruption_count or 0,
+            "skipped_trade_count": record.skipped_trade_count or 0,
             "reason": None
             if healthy
             else "no recent successful collection cycle or latest cycle failed",
@@ -177,6 +274,7 @@ class Database:
         pair: MarketPair,
         base_amount: Decimal,
         quote_amount: Decimal,
+        provenance: TradeProvenance | None = None,
     ) -> bool:
         if base_amount <= 0 or quote_amount < 0:
             raise ValueError("Trade base amount must be positive and quote amount nonnegative")
@@ -205,6 +303,7 @@ class Database:
                     quote_amount=quote_amount,
                     price=price,
                     source_ref=event.source_ref,
+                    **_provenance_columns(provenance),
                 )
             )
             window = await session.scalar(
@@ -450,11 +549,16 @@ class Database:
                     .limit(1)
                 )
                 if observation is None:
-                    if evaluation_time >= deadline:
+                    if evaluation_time < deadline:
+                        continue
+                    outcome = await _apply_trade_fallback(
+                        session, evaluation, evaluation_time, grace
+                    )
+                    if outcome == "missing":
                         evaluation.status = "missing_observation"
                         evaluation.data_quality = "missing_observation"
                         evaluation.evaluated_at = evaluation_time
-                        finalized += 1
+                    finalized += 1
                     continue
 
                 reference = evaluation.reference_price
@@ -462,6 +566,7 @@ class Database:
                 if reference is None or reference <= 0:
                     evaluation.status = "missing_reference"
                     evaluation.data_quality = "missing_reference"
+                    evaluation.missing_reason = "no_reference_snapshot_price"
                     evaluation.evaluated_at = evaluation_time
                     finalized += 1
                     continue
@@ -505,9 +610,47 @@ class Database:
                 evaluation.largest_gap_seconds = max(gaps, default=None)
                 evaluation.status = "measured"
                 evaluation.data_quality = "sampled" if len(prices) >= 2 else "single_observation"
+                evaluation.price_basis = PRICE_BASIS_SNAPSHOT
+                evaluation.observation_ref = f"snapshot:{observation.id}"
+                evaluation.reference_observed_at = _as_utc(evaluation.reference_at)
+                evaluation.missing_reason = None
                 evaluation.evaluated_at = evaluation_time
                 finalized += 1
         return finalized
+
+    async def reevaluate_missing_with_trades(
+        self,
+        *,
+        now: datetime | None = None,
+        dry_run: bool = False,
+        grace: timedelta = EVALUATION_OBSERVATION_GRACE,
+    ) -> dict[str, int]:
+        """Explicit, idempotent backfill: retry old missing evaluations with trade prices.
+
+        Only evaluations that are still "missing_observation" and have no price basis are
+        considered. Evaluations that cannot be resolved are left untouched.
+        """
+        evaluation_time = _as_utc(now or datetime.now(UTC))
+        counts = {"candidates": 0, "measured": 0, "unresolved": 0}
+        async with self.sessions.begin() as session:
+            candidates = (
+                await session.scalars(
+                    select(SignalEvaluationRecord)
+                    .where(
+                        SignalEvaluationRecord.status == "missing_observation",
+                        SignalEvaluationRecord.price_basis.is_(None),
+                        SignalEvaluationRecord.target_at <= evaluation_time - grace,
+                    )
+                    .order_by(SignalEvaluationRecord.target_at)
+                )
+            ).all()
+            counts["candidates"] = len(candidates)
+            for evaluation in candidates:
+                outcome = await _apply_trade_fallback(session, evaluation, evaluation_time, grace)
+                counts["measured" if outcome == "measured" else "unresolved"] += 1
+            if dry_run:
+                await session.rollback()
+        return counts
 
     async def evaluation_report(
         self,
@@ -534,7 +677,7 @@ class Database:
             rows = (await session.execute(query)).all()
 
         grouped: dict[
-            tuple[str, str, str, str, int],
+            tuple[str, str, str, str, int, str],
             list[tuple[SignalRecord, SignalEvaluationRecord]],
         ] = defaultdict(list)
         for signal, evaluation in rows:
@@ -545,11 +688,14 @@ class Database:
                     signal.severity,
                     signal.confidence,
                     evaluation.horizon_minutes,
+                    _price_basis_label(evaluation),
                 )
             ].append((signal, evaluation))
 
         report: list[dict[str, object]] = []
-        for (category, pair, severity, confidence, horizon), entries in sorted(grouped.items()):
+        for (category, pair, severity, confidence, horizon, basis), entries in sorted(
+            grouped.items()
+        ):
             measured = [
                 evaluation
                 for _, evaluation in entries
@@ -572,6 +718,7 @@ class Database:
                     "severity": severity,
                     "confidence": confidence,
                     "horizon_minutes": horizon,
+                    "price_basis": basis,
                     "signals": len(entries),
                     "measured": len(measured),
                     "missing": missing,
@@ -608,6 +755,90 @@ class Database:
         return report
 
 
+async def _apply_trade_fallback(
+    session: Any,
+    evaluation: SignalEvaluationRecord,
+    evaluation_time: datetime,
+    grace: timedelta,
+) -> str:
+    """Measure an evaluation from persisted trades; returns "measured" or "missing".
+
+    The reference and measured prices both come from trades, so snapshot and trade
+    price bases are never mixed inside one evaluation.
+    """
+    target = _as_utc(evaluation.target_at)
+    reference_at = _as_utc(evaluation.reference_at)
+    usable = (
+        TradeRecord.pair_key == evaluation.pair_key,
+        TradeRecord.quote_amount > 0,
+        TradeRecord.base_amount > 0,
+        TradeRecord.price > 0,
+    )
+    measured = await session.scalar(
+        select(TradeRecord)
+        .where(
+            *usable,
+            TradeRecord.occurred_at >= target,
+            TradeRecord.occurred_at <= target + grace,
+            TradeRecord.occurred_at <= evaluation_time,
+        )
+        .order_by(TradeRecord.occurred_at, TradeRecord.trade_id)
+        .limit(1)
+    )
+    if measured is None:
+        evaluation.missing_reason = "no_snapshot_and_no_trade_in_grace"
+        return "missing"
+    reference = await session.scalar(
+        select(TradeRecord)
+        .where(
+            *usable,
+            TradeRecord.occurred_at <= reference_at,
+            TradeRecord.occurred_at >= reference_at - TRADE_REFERENCE_LOOKBACK,
+        )
+        .order_by(TradeRecord.occurred_at.desc(), TradeRecord.trade_id.desc())
+        .limit(1)
+    )
+    if reference is None:
+        evaluation.missing_reason = "no_reference_trade_in_lookback"
+        return "missing"
+    series = (
+        await session.scalars(
+            select(TradeRecord)
+            .where(
+                *usable,
+                TradeRecord.occurred_at >= reference.occurred_at,
+                TradeRecord.occurred_at <= measured.occurred_at,
+            )
+            .order_by(TradeRecord.occurred_at, TradeRecord.trade_id)
+        )
+    ).all()
+    if len(series) < MIN_TRADE_OBSERVATIONS:
+        evaluation.missing_reason = "insufficient_trade_observations"
+        return "missing"
+    changes = [(trade.price / reference.price - Decimal(1)) * Decimal(100) for trade in series]
+    times = [_as_utc(trade.occurred_at) for trade in series]
+    gaps = [
+        int((right - left).total_seconds()) for left, right in zip(times, times[1:], strict=False)
+    ]
+    evaluation.reference_price = reference.price
+    evaluation.reference_source = f"trade:{reference.trade_id}"
+    evaluation.reference_observed_at = _as_utc(reference.occurred_at)
+    evaluation.measured_price = measured.price
+    evaluation.measured_at = _as_utc(measured.occurred_at)
+    evaluation.return_percent = (measured.price / reference.price - Decimal(1)) * Decimal(100)
+    evaluation.max_increase_percent = max([Decimal(0), *changes])
+    evaluation.max_decrease_percent = min([Decimal(0), *changes])
+    evaluation.observation_count = len(series)
+    evaluation.largest_gap_seconds = max(gaps, default=None)
+    evaluation.status = "measured"
+    evaluation.data_quality = "trade_sampled"
+    evaluation.price_basis = PRICE_BASIS_TRADE
+    evaluation.observation_ref = f"trade:{measured.trade_id}"
+    evaluation.missing_reason = None
+    evaluation.evaluated_at = evaluation_time
+    return "measured"
+
+
 async def _save_cursor(session: Any, stream_key: str, cursor: str) -> None:
     record = await session.get(CursorRecord, stream_key)
     if record is None:
@@ -620,6 +851,23 @@ async def _delete_count(session: Any, model: type[Base], predicate: Any) -> int:
     count = await session.scalar(select(func.count()).select_from(model).where(predicate))
     await session.execute(delete(model).where(predicate))
     return count or 0
+
+
+def _provenance_columns(provenance: TradeProvenance | None) -> dict[str, Any]:
+    if provenance is None:
+        return {}
+    return {
+        "venue": provenance.venue,
+        "base_is_seller": provenance.base_is_seller,
+        "base_asset": provenance.base_asset,
+        "counter_asset": provenance.counter_asset,
+        "operation_id": provenance.operation_id,
+        "transaction_hash": provenance.transaction_hash,
+        "base_account": provenance.base_account,
+        "counter_account": provenance.counter_account,
+        "liquidity_pool_id": provenance.liquidity_pool_id,
+        "observed_at": provenance.observed_at,
+    }
 
 
 def _event_record(event: ChainEvent) -> EventRecord:
@@ -647,6 +895,14 @@ def _optional_decimal(value: object) -> Decimal | None:
     except (ValueError, ArithmeticError):
         return None
     return result if result.is_finite() else None
+
+
+def _price_basis_label(evaluation: SignalEvaluationRecord) -> str:
+    """Rows are never mixed across price bases; unmeasured evaluations have basis "none"."""
+    if evaluation.status != "measured":
+        return "none"
+    # Measured rows written before the fallback existed were snapshot-based by construction.
+    return evaluation.price_basis or PRICE_BASIS_SNAPSHOT
 
 
 def _mid_price(record: MarketSnapshotRecord) -> Decimal | None:

@@ -103,8 +103,6 @@ services:
       - /tmp
     cap_drop:
       - ALL
-    security_opt:
-      - no-new-privileges:true
     stop_grace_period: 15s
     logging:
       driver: json-file
@@ -134,8 +132,6 @@ services:
       - /var/run
     cap_drop:
       - ALL
-    security_opt:
-      - no-new-privileges:true
     stop_grace_period: 15s
     logging:
       driver: json-file

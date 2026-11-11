@@ -40,6 +40,12 @@ export type Overview = {
     last_success_at: string | null;
     last_error_at: string | null;
     last_error: string | null;
+    consecutive_failures?: number;
+    interruption_count?: number;
+    last_interruption_at?: string | null;
+    skipped_trade_count?: number;
+    last_skipped_at?: string | null;
+    last_skipped_reason?: string | null;
   };
   database: { status: string };
   counts: { events: number; signals: number };
@@ -75,7 +81,43 @@ export type SignalDetail = Signal & {
     data_quality: string;
     observation_count: number;
     largest_gap_seconds: number | null;
+    price_basis?: string | null;
+    observation_ref?: string | null;
+    reference_observed_at?: string | null;
+    missing_reason?: string | null;
   }[];
+  volume_evidence?: VolumeEvidence | null;
+  account_diagnostics_available?: boolean;
+};
+
+export type EvidenceTrade = {
+  trade_id: string;
+  occurred_at: string;
+  base_amount: string;
+  quote_amount: string;
+  price: string;
+  venue: string | null;
+  source_ref: string | null;
+};
+
+type VolumeBucket = { count: number; base_volume: string; quote_volume: string };
+
+export type VolumeEvidence = {
+  trade_count: number;
+  base_volume: string;
+  quote_volume: string;
+  venues: Record<string, VolumeBucket>;
+  coverage: { venue_trades: number; orientation_trades: number; operation_trades: number; total_trades: number };
+  largest_trade_share_percent: string | null;
+  largest_trades_by_base: EvidenceTrade[];
+  mean_trade_base_size: string | null;
+  median_trade_base_size: string | null;
+  distinct_operations: number | null;
+  top_operations: { operation_id: string; trade_count: number; base_volume: string; share_percent: string | null }[];
+  direction: { note: string } & Record<string, VolumeBucket | string>;
+  distinct_accounts: number | null;
+  matches_signal_volume?: boolean;
+  signal_observed_base_volume?: string | null;
 };
 
 export type Activity = {
@@ -108,6 +150,7 @@ export type Analytics = {
     category: string;
     severity: string;
     horizon_minutes: number;
+    price_basis?: string | null;
     signals: number;
     measured: number;
     missing: number;
@@ -124,6 +167,8 @@ export type Analytics = {
     events: number;
     market_snapshots: number;
     trades: number;
+    trades_with_provenance?: number;
+    measured_by_price_basis?: Record<string, number>;
     evaluations: number;
     measured_evaluations: number;
     missing_evaluations: number;
@@ -132,6 +177,7 @@ export type Analytics = {
   };
   price_evaluations: {
     horizon_minutes: number;
+    price_basis?: string;
     sample_count: number;
     minimum_sample_count: number;
     mean_observed_change_percent: string | null;

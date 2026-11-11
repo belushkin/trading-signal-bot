@@ -14,6 +14,9 @@ from stellar_intelligence_bot.core.markets import MarketPair
 logger = logging.getLogger(__name__)
 
 
+MALFORMED_RECORD_KEY = "_malformed_record"
+
+
 class HorizonClient:
     def __init__(
         self,
@@ -115,12 +118,16 @@ class HorizonClient:
             ordered = records if cursor else list(reversed(records))
             for record in ordered:
                 if not isinstance(record, dict):
-                    raise ValueError(f"Malformed Horizon record on {path}")
+                    # Let the consumer skip one bad record instead of failing the whole page.
+                    yield {MALFORMED_RECORD_KEY: repr(record)[:200]}
+                    continue
                 yield record
 
             if not cursor or len(records) < 200 or (max_pages is not None and pages >= max_pages):
                 return
             last_record = records[-1]
+            if not isinstance(last_record, dict):
+                raise ValueError(f"Horizon page on {path} ends with a malformed record")
             next_cursor = last_record.get("paging_token")
             if not isinstance(next_cursor, str) or not next_cursor:
                 raise ValueError(f"Horizon record on {path} lacks paging_token")

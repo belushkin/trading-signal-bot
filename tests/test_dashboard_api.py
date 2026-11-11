@@ -324,3 +324,71 @@ async def test_signal_details_do_not_expose_internal_source_urls_or_query_creden
     assert response.json()["source"]["source_ref"] is None
     assert response.json()["source"]["explorer_url"] is None
     assert "reference_source" not in response.json()["observed_facts"]
+
+
+async def _seed_volume_signal(database: Database) -> str:
+    from stellar_intelligence_bot.storage.models import TradeRecord
+
+    start = datetime(2026, 1, 1, tzinfo=UTC)
+    now = datetime.now(UTC)
+    async with database.sessions.begin() as session:
+        session.add(
+            EventRecord(
+                event_id="vol:1", chain="stellar", event_type="volume", occurred_at=now,
+                source_ref="https://horizon.stellar.org/trades", attributes={},
+            )
+        )
+        session.add(
+            SignalRecord(
+                signal_id="vol-signal", deduplication_key="vol", event_id="vol:1",
+                occurred_at=now, category="volume_anomaly", severity="HIGH", confidence="HIGH",
+                observed_facts={
+                    "pair": PAIR, "window_start": start.isoformat(),
+                    "window_end": (start + timedelta(minutes=5)).isoformat(),
+                    "observed_base_volume": "30",
+                },
+                interpretation="Observed volume", expires_at=now + timedelta(minutes=30),
+            )
+        )
+        for index, (venue, seller, base) in enumerate(
+            (("order_book", True, "20"), ("liquidity_pool", None, "10"))
+        ):
+            session.add(
+                TradeRecord(
+                    trade_id=f"t{index}", pair_key=PAIR,
+                    occurred_at=start + timedelta(minutes=index + 1),
+                    base_amount=Decimal(base), quote_amount=Decimal(base), price=Decimal(1),
+                    source_ref="https://horizon.stellar.org/trades/x",
+                    venue=venue, base_is_seller=seller, operation_id=f"op{index}",
+                    base_account="GACCOUNTSECRET", counter_account=None,
+                )
+            )
+    return "vol-signal"
+
+
+@pytest.mark.asyncio
+async def test_volume_signal_exposes_venue_evidence_without_accounts(tmp_path) -> None:
+    settings = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
+    async with _api(str(tmp_path / "ev.db"), settings) as (client, database):
+        signal_id = await _seed_volume_signal(database)
+        detail = await client.get(f"/api/signals/{signal_id}")
+        denied = await client.get(f"/api/signals/{signal_id}/account-diagnostics")
+    body = detail.json()
+    evidence = body["volume_evidence"]
+    assert evidence["matches_signal_volume"] is True
+    assert Decimal(evidence["venues"]["order_book"]["base_volume"]) == 20
+    assert "GACCOUNTSECRET" not in detail.text
+    assert body["account_diagnostics_available"] is False
+    assert denied.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_account_diagnostics_are_opt_in(tmp_path) -> None:
+    settings = Settings(
+        monitored_pairs=(MarketPair.parse(PAIR),), account_diagnostics_enabled=True
+    )
+    async with _api(str(tmp_path / "diag.db"), settings) as (client, database):
+        signal_id = await _seed_volume_signal(database)
+        response = await client.get(f"/api/signals/{signal_id}/account-diagnostics")
+    assert response.status_code == 200
+    assert "GACCOUNTSECRET" in response.text

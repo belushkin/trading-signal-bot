@@ -16,8 +16,10 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stellar_intelligence_bot.app.config import Settings
+from stellar_intelligence_bot.app.trade_evidence import account_diagnostics, trade_window_evidence
 from stellar_intelligence_bot.core.market_anomalies import (
     LARGE_TRADE_MIN_SAMPLES,
     BookObservation,
@@ -137,6 +139,16 @@ def create_app(
                 if collector and collector.last_error_at
                 else None,
                 "last_error": collector.last_error if collector else None,
+                "consecutive_failures": collector.consecutive_failures if collector else 0,
+                "interruption_count": collector.interruption_count if collector else 0,
+                "last_interruption_at": _iso(collector.last_interruption_at)
+                if collector and collector.last_interruption_at
+                else None,
+                "skipped_trade_count": collector.skipped_trade_count if collector else 0,
+                "last_skipped_at": _iso(collector.last_skipped_at)
+                if collector and collector.last_skipped_at
+                else None,
+                "last_skipped_reason": collector.last_skipped_reason if collector else None,
                 "stale_after_seconds": int(stale_after.total_seconds()),
             },
             "checked_at": _iso(now),
@@ -214,6 +226,10 @@ def create_app(
                 if runtime and runtime.last_error_at
                 else None,
                 "last_error": runtime.last_error if runtime else None,
+                "consecutive_failures": runtime.consecutive_failures if runtime else 0,
+                "interruption_count": runtime.interruption_count if runtime else 0,
+                "skipped_trade_count": runtime.skipped_trade_count if runtime else 0,
+                "last_skipped_reason": runtime.last_skipped_reason if runtime else None,
             },
             "database": {"status": "healthy"},
             "counts": {"events": event_count or 0, "signals": signal_count or 0},
@@ -426,10 +442,13 @@ def create_app(
                         .order_by(SignalEvaluationRecord.horizon_minutes)
                     )
                 ).all()
+                evidence = await _volume_evidence(session, row)
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Signal detail is temporarily unavailable") from exc
         return {
             **_signal_summary(row),
+            "volume_evidence": evidence,
+            "account_diagnostics_available": request.app.state.settings.account_diagnostics_enabled,
             "observed_facts": _safe_facts(row.observed_facts),
             "interpretation": row.interpretation,
             "expires_at": _iso(_as_utc(row.expires_at)),
@@ -437,6 +456,25 @@ def create_app(
             "source": _event_source(event) if event else None,
             "evaluations": [_evaluation(item) for item in evaluations],
         }
+
+    @app.get("/api/signals/{signal_id}/account-diagnostics")
+    async def signal_account_diagnostics(
+        request: Request, signal_id: Annotated[str, Path(min_length=1, max_length=255)]
+    ) -> dict[str, object]:
+        if not request.app.state.settings.account_diagnostics_enabled:
+            raise HTTPException(404, "Account diagnostics are disabled")
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                row = await session.get(SignalRecord, signal_id)
+                if row is None:
+                    raise HTTPException(404, "Signal was not found")
+                trades = await _window_trades(session, row)
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Account diagnostics are temporarily unavailable") from exc
+        if trades is None:
+            raise HTTPException(404, "Signal has no trade window")
+        return account_diagnostics(trades)
 
     @app.get("/api/activity")
     async def activity(
@@ -554,6 +592,7 @@ def create_app(
                         select(
                             SignalEvaluationRecord.horizon_minutes,
                             SignalEvaluationRecord.status,
+                            SignalEvaluationRecord.price_basis,
                             func.count(),
                             func.avg(SignalEvaluationRecord.return_percent),
                         )
@@ -564,9 +603,15 @@ def create_app(
                         .group_by(
                             SignalEvaluationRecord.horizon_minutes,
                             SignalEvaluationRecord.status,
+                            SignalEvaluationRecord.price_basis,
                         )
                     )
                 ).all()
+                trades_with_provenance = await session.scalar(
+                    select(func.count())
+                    .select_from(TradeRecord)
+                    .where(TradeRecord.occurred_at >= cutoff, TradeRecord.venue.is_not(None))
+                )
                 event_count = await session.scalar(
                     select(func.count())
                     .select_from(EventRecord)
@@ -597,13 +642,16 @@ def create_app(
         missing_count = sum(
             count for status, count in counts.items() if status.startswith("missing")
         )
-        measured_by_horizon: dict[int, tuple[int, Decimal | None]] = {}
-        for horizon, status, count, mean_change in evaluation_groups:
+        measured_by_horizon: dict[tuple[int, str], tuple[int, Decimal | None]] = {}
+        measured_by_basis: dict[str, int] = {}
+        for horizon, status, basis, count, mean_change in evaluation_groups:
             if status == "measured" and isinstance(horizon, int) and isinstance(count, int):
-                measured_by_horizon[horizon] = (
+                label = str(basis or "snapshot_mid")
+                measured_by_horizon[(horizon, label)] = (
                     count,
                     Decimal(str(mean_change)) if mean_change is not None else None,
                 )
+                measured_by_basis[label] = measured_by_basis.get(label, 0) + count
         frequency_by_day = {str(day): count for day, count in frequency_rows}
         today = datetime.now(UTC).date()
         start_day = today - timedelta(days=days - 1)
@@ -630,18 +678,23 @@ def create_app(
             "price_evaluations": [
                 {
                     "horizon_minutes": horizon,
+                    "price_basis": basis,
                     "sample_count": sample_count,
                     "minimum_sample_count": 10,
                     "mean_observed_change_percent": _decimal(mean_change)
                     if sample_count >= 10 and mean_change is not None
                     else None,
                 }
-                for horizon, (sample_count, mean_change) in sorted(measured_by_horizon.items())
+                for (horizon, basis), (sample_count, mean_change) in sorted(
+                    measured_by_horizon.items()
+                )
             ],
             "data_coverage": {
                 "events": event_count or 0,
                 "market_snapshots": market_count or 0,
                 "trades": trade_count or 0,
+                "trades_with_provenance": trades_with_provenance or 0,
+                "measured_by_price_basis": dict(sorted(measured_by_basis.items())),
                 "evaluations": total_evaluations,
                 "measured_evaluations": measured_count,
                 "missing_evaluations": missing_count,
@@ -944,6 +997,53 @@ def _safe_facts(facts: dict[str, object]) -> dict[str, object]:
     }
 
 
+async def _window_trades(session: AsyncSession, signal: SignalRecord) -> list[TradeRecord] | None:
+    facts = signal.observed_facts
+    pair = facts.get("pair")
+    try:
+        start = datetime.fromisoformat(str(facts["window_start"]))
+        end = datetime.fromisoformat(str(facts["window_end"]))
+    except (KeyError, ValueError):
+        return None
+    if signal.category != "volume_anomaly" or not isinstance(pair, str):
+        return None
+    return list(
+        (
+            await session.scalars(
+                select(TradeRecord)
+                .where(
+                    TradeRecord.pair_key == pair,
+                    TradeRecord.occurred_at >= start,
+                    TradeRecord.occurred_at < end,
+                )
+                .order_by(TradeRecord.occurred_at, TradeRecord.trade_id)
+            )
+        ).all()
+    )
+
+
+async def _volume_evidence(
+    session: AsyncSession, signal: SignalRecord
+) -> dict[str, object] | None:
+    trades = await _window_trades(session, signal)
+    if trades is None:
+        return None
+    evidence = trade_window_evidence(trades)
+    stored = _decimal_or_none(signal.observed_facts.get("observed_base_volume"))
+    evidence["signal_observed_base_volume"] = _decimal(stored)
+    evidence["matches_signal_volume"] = stored is not None and stored == sum(
+        (trade.base_amount for trade in trades), Decimal(0)
+    )
+    return evidence
+
+
+def _decimal_or_none(value: object) -> Decimal | None:
+    try:
+        return Decimal(str(value))
+    except (ArithmeticError, ValueError):
+        return None
+
+
 def _evaluation(row: SignalEvaluationRecord) -> dict[str, object]:
     return {
         "horizon_minutes": row.horizon_minutes,
@@ -956,7 +1056,27 @@ def _evaluation(row: SignalEvaluationRecord) -> dict[str, object]:
         "data_quality": row.data_quality,
         "observation_count": row.observation_count,
         "largest_gap_seconds": row.largest_gap_seconds,
+        "price_basis": _evaluation_basis(row),
+        "observation_ref": row.observation_ref,
+        "reference_observed_at": _iso(row.reference_observed_at)
+        if row.reference_observed_at
+        else None,
+        "missing_reason": _missing_reason(row),
     }
+
+
+def _evaluation_basis(row: SignalEvaluationRecord) -> str | None:
+    if row.status != "measured":
+        return None
+    return row.price_basis or "snapshot_mid"
+
+
+def _missing_reason(row: SignalEvaluationRecord) -> str | None:
+    if not row.status.startswith("missing"):
+        return None
+    if row.missing_reason:
+        return row.missing_reason
+    return "no_snapshot_in_grace_window_legacy_no_trade_fallback"
 
 
 def _mid(row: MarketSnapshotRecord) -> Decimal | None:

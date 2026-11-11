@@ -178,6 +178,41 @@ describe("dashboard request states", () => {
     expect(screen.getByText("0 / 0 / 1")).toBeInTheDocument();
   });
 
+  it("keeps snapshot-based and trade-based evaluations in separate analytics rows", async () => {
+    const overview = {
+      collector: { status: "healthy", last_success_at: null, last_error_at: null, last_error: null,
+        interruption_count: 2, skipped_trade_count: 3, last_skipped_reason: "dust_zero_base_amount" },
+      database: { status: "healthy" }, counts: { events: 0, signals: 0 },
+      last_event_at: null, last_signal_at: null, data_freshness_seconds: null,
+      monitored_pairs: [], markets: [], recent_signals: [], warnings: [],
+      generated_at: "2026-01-01T00:00:00Z",
+    };
+    const row = (price_basis: string) => ({ pair: "native/USDC:issuer", category: "volume_anomaly",
+      severity: "HIGH", horizon_minutes: 15, price_basis, signals: 1, measured: 1, missing: 0,
+      pending: 0, mean_observed_change_percent: null, median_observed_change_percent: null,
+      positive_percent: null, negative_percent: null });
+    const analytics = {
+      excluded_legacy_signals: 0, market_quality: [], signals_by_category: [], signals_by_severity: [],
+      signal_frequency: [], price_evaluations: [],
+      data_coverage: { events: 0, market_snapshots: 0, trades: 4, trades_with_provenance: 3,
+        measured_by_price_basis: { snapshot_mid: 1, trade_price: 1 }, evaluations: 2,
+        measured_evaluations: 2, missing_evaluations: 0, pending_evaluations: 0,
+        missing_observation_rate_percent: "0" },
+      outcomes_by_pair: [row("snapshot_mid"), row("trade_price")],
+    };
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => ({
+      ok: true,
+      json: async () => String(input).includes("/api/health") ? { refresh_seconds: 20 }
+        : String(input).includes("/api/analytics") ? analytics : overview,
+    })));
+    render(<App />);
+    expect(await screen.findByText(/3 skipped trades/)).toBeInTheDocument();
+    fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
+    expect(await screen.findByText("Order-book mid")).toBeInTheDocument();
+    expect(screen.getByText("Trade price (fallback)")).toBeInTheDocument();
+    expect(screen.getByText("3 / 4")).toBeInTheDocument();
+  });
+
   it("offers filters for all current market signal categories", async () => {
     const overview = {
       collector: { status: "starting", last_success_at: null, last_error_at: null, last_error: null },

@@ -55,6 +55,7 @@ class Settings:
     price_anomaly_floor_percent: Decimal = Decimal("1")
     price_windows_minutes: tuple[int, ...] = (5, 15, 60, 240)
     retention_days: int = 30
+    account_diagnostics_enabled: bool = False
 
     @classmethod
     def from_env(cls) -> Settings:
@@ -142,6 +143,8 @@ class Settings:
             price_anomaly_floor_percent=price_floor,
             price_windows_minutes=price_windows,
             retention_days=retention_days,
+            account_diagnostics_enabled=os.getenv("BOT_ACCOUNT_DIAGNOSTICS", "").lower()
+            in {"1", "true", "yes"},
         )
 
 

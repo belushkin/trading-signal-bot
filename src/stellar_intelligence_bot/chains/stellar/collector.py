@@ -2,17 +2,19 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import AsyncIterator, Mapping
 from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
-from stellar_intelligence_bot.chains.base import CollectedEvent
-from stellar_intelligence_bot.chains.stellar.client import HorizonClient
+from stellar_intelligence_bot.chains.base import CollectedEvent, TradeProvenance
+from stellar_intelligence_bot.chains.stellar.client import MALFORMED_RECORD_KEY, HorizonClient
 from stellar_intelligence_bot.core.events import Chain, ChainEvent
 from stellar_intelligence_bot.core.markets import MarketPair
 
+logger = logging.getLogger(__name__)
 EXPLORER_TX = "https://stellar.expert/explorer/public/tx"
 MAX_CHAIN_PAGES_PER_CYCLE = 5
 
@@ -93,10 +95,48 @@ class StellarCollector:
         async for record in self.client.records(
             "trades", cursor=cursor, params=pair.horizon_params()
         ):
+            token = record.get("paging_token")
+            record_cursor = token if isinstance(token, str) and token else None
+            if MALFORMED_RECORD_KEY in record:
+                reason = "malformed_record: Horizon returned a non-object trade record"
+                logger.warning(
+                    "Skipping malformed Horizon trade record pair=%s detail=%s",
+                    pair.key,
+                    record[MALFORMED_RECORD_KEY],
+                )
+                yield CollectedEvent(None, stream_key=stream, cursor=None, skipped_reason=reason)
+                continue
+            if _is_zero_base_dust(record):
+                # Horizon rounds sub-stroop base amounts to zero; nothing meaningful to store.
+                logger.info(
+                    "Skipping zero-base dust trade pair=%s trade_id=%s",
+                    pair.key,
+                    record.get("id"),
+                )
+                yield CollectedEvent(
+                    None,
+                    stream_key=stream,
+                    cursor=record_cursor,
+                    skipped_reason="dust_zero_base_amount",
+                )
+                continue
             try:
                 event, base_amount, quote_amount = parse_trade(record, pair)
-            except (KeyError, ValueError, InvalidOperation) as exc:
-                raise ValueError(f"Malformed Horizon trade on {pair.key}") from exc
+                provenance = parse_trade_provenance(record, pair, observed_at=datetime.now(UTC))
+            except (KeyError, ValueError, TypeError, AttributeError, InvalidOperation) as exc:
+                reason = f"malformed_trade: {exc}"[:300]
+                logger.warning(
+                    "Skipping malformed Horizon trade pair=%s trade_id=%s paging_token=%s "
+                    "reason=%s",
+                    pair.key,
+                    record.get("id"),
+                    token,
+                    reason,
+                )
+                yield CollectedEvent(
+                    None, stream_key=stream, cursor=record_cursor, skipped_reason=reason
+                )
+                continue
             yield CollectedEvent(
                 event,
                 stream_key=stream,
@@ -104,6 +144,7 @@ class StellarCollector:
                 pair=pair,
                 base_amount=base_amount,
                 quote_amount=quote_amount,
+                provenance=provenance,
             )
 
     async def _market_snapshot(
@@ -186,6 +227,68 @@ def parse_payment_operation(record: Mapping[str, Any]) -> ChainEvent | None:
         occurred_at=occurred_at,
         source_ref=f"{EXPLORER_TX}/{transaction_hash}",
         attributes=facts,
+    )
+
+
+def parse_trade_time(record: Mapping[str, Any]) -> datetime:
+    return _parse_time(record["ledger_close_time"])
+
+
+def _is_zero_base_dust(record: Mapping[str, Any]) -> bool:
+    try:
+        return _decimal(record["base_amount"]) == 0
+    except (KeyError, ValueError, InvalidOperation):
+        return False
+
+
+def _asset_key(record: Mapping[str, Any], prefix: str) -> str | None:
+    kind = record.get(f"{prefix}_asset_type")
+    if kind == "native":
+        return "native"
+    code = record.get(f"{prefix}_asset_code")
+    issuer = record.get(f"{prefix}_asset_issuer")
+    if isinstance(code, str) and isinstance(issuer, str) and code and issuer:
+        return f"{code}:{issuer}"
+    return None
+
+
+def _text(value: object) -> str | None:
+    return value if isinstance(value, str) and value else None
+
+
+def parse_trade_provenance(
+    record: Mapping[str, Any], pair: MarketPair, *, observed_at: datetime | None
+) -> TradeProvenance:
+    """Extract source facts without inferring anything the Horizon record does not state."""
+    base_asset = _asset_key(record, "base")
+    counter_asset = _asset_key(record, "counter")
+    if (base_asset is not None and base_asset != pair.base.key) or (
+        counter_asset is not None and counter_asset != pair.quote.key
+    ):
+        raise ValueError(
+            f"Trade asset identity {base_asset}/{counter_asset} does not match {pair.key}"
+        )
+    trade_type = record.get("trade_type")
+    venue = {"orderbook": "order_book", "liquidity_pool": "liquidity_pool"}.get(str(trade_type))
+    base_is_seller = record.get("base_is_seller")
+    links = record.get("_links")
+    operation = links.get("operation") if isinstance(links, Mapping) else None
+    href = operation.get("href") if isinstance(operation, Mapping) else None
+    operation_id = href.rstrip("/").rsplit("/", 1)[-1] if isinstance(href, str) else None
+    if operation_id is not None and not operation_id.isdigit():
+        operation_id = None
+    return TradeProvenance(
+        venue=venue,
+        base_is_seller=base_is_seller if isinstance(base_is_seller, bool) else None,
+        base_asset=base_asset,
+        counter_asset=counter_asset,
+        operation_id=operation_id,
+        transaction_hash=_text(record.get("transaction_hash")),
+        base_account=_text(record.get("base_account")),
+        counter_account=_text(record.get("counter_account")),
+        liquidity_pool_id=_text(record.get("base_liquidity_pool_id"))
+        or _text(record.get("counter_liquidity_pool_id")),
+        observed_at=observed_at,
     )
 
 

@@ -43,6 +43,7 @@ import {
   queryString,
   Signal,
   SignalDetail,
+  VolumeEvidence,
 } from "./api";
 
 type View = "Overview" | "Markets" | "Signals" | "Activity" | "Analytics";
@@ -289,6 +290,7 @@ function OverviewPage({ data, onSignal, onPair, onSignals }: { data: Overview; o
         <MetricCard title="Collected events" value={formatInteger(data.counts.events)} detail="Persisted from Stellar Horizon" icon={<Database size={17} />} />
         <MetricCard title="Generated signals" value={formatInteger(data.counts.signals)} detail="Rule-based observations" icon={<BellRing size={17} />} />
         <MetricCard title="Monitored markets" value={formatInteger(data.monitored_pairs.length)} detail="From current configuration" icon={<Waves size={17} />} />
+        <MetricCard title="Collector interruptions" value={formatInteger(data.collector.interruption_count ?? 0)} detail={`${formatInteger(data.collector.skipped_trade_count ?? 0)} skipped trades${data.collector.last_skipped_reason ? ` · last: ${data.collector.last_skipped_reason}` : ""}`} icon={<AlertTriangle size={17} />} />
         <MetricCard title="Last collection" value={data.collector.last_success_at ? relativeTime(data.collector.last_success_at) : "N/A"} detail={data.collector.last_error ? "Latest cycle reported an error" : "Latest successful collector cycle"} icon={<Clock3 size={17} />} />
       </div>
       <section className="section-block">
@@ -408,6 +410,7 @@ function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number;
         <MetricCard title="Events in period" value={formatInteger(data.data_coverage.events)} detail="Persisted chain events" icon={<Database size={17} />} />
         <MetricCard title="Order-book snapshots" value={formatInteger(data.data_coverage.market_snapshots)} detail="Actual recorded observations" icon={<Waves size={17} />} />
         <MetricCard title="Measured evaluations" value={formatInteger(data.data_coverage.measured_evaluations)} detail={`${formatInteger(data.data_coverage.missing_evaluations)} missing · ${formatInteger(data.data_coverage.pending_evaluations)} pending`} icon={<ActivityIcon size={17} />} />
+        <MetricCard title="Trade provenance" value={`${formatInteger(data.data_coverage.trades_with_provenance ?? 0)} / ${formatInteger(data.data_coverage.trades)}`} detail={`Measured: ${Object.entries(data.data_coverage.measured_by_price_basis ?? {}).map(([k, v]) => `${priceBasisLabel(k)} ${v}`).join(", ") || "none"}`} icon={<ActivityIcon size={17} />} />
         <MetricCard title="Missing rate" value={data.data_coverage.missing_observation_rate_percent === null ? "N/A" : `${formatNumber(data.data_coverage.missing_observation_rate_percent)}%`} detail="Of persisted signal evaluation horizons" icon={<AlertTriangle size={17} />} />
       </div>
       <div className="chart-grid">
@@ -421,7 +424,7 @@ function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number;
       <section className="section-block">
         <SectionHeading title="Observed price changes after signals" detail="Descriptive change by horizon; sampled observations only." />
         <div className="panel evaluation-summary">
-          {data.price_evaluations.length ? <div className="horizon-stats">{data.price_evaluations.map((evaluation) => <div key={evaluation.horizon_minutes}><small>{formatHorizon(evaluation.horizon_minutes)}</small><strong>{evaluation.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(evaluation.mean_observed_change_percent)}%`}</strong><span>{evaluation.sample_count} / {evaluation.minimum_sample_count} observations</span></div>)}</div> : <EmptyState title="No completed price evaluations" detail="Subsequent observations will appear here when signal evaluation horizons are reached." compact />}
+          {data.price_evaluations.length ? <div className="horizon-stats">{data.price_evaluations.map((evaluation) => <div key={`${evaluation.horizon_minutes}-${evaluation.price_basis ?? ""}`}><small>{formatHorizon(evaluation.horizon_minutes)} · {priceBasisLabel(evaluation.price_basis)}</small><strong>{evaluation.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(evaluation.mean_observed_change_percent)}%`}</strong><span>{evaluation.sample_count} / {evaluation.minimum_sample_count} observations</span></div>)}</div> : <EmptyState title="No completed price evaluations" detail="Subsequent observations will appear here when signal evaluation horizons are reached." compact />}
           <p>Observed changes are not profitability or directional accuracy. A mean is shown only with at least 10 measured observations for that horizon.</p>
         </div>
       </section>
@@ -433,8 +436,8 @@ function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number;
       </section>
       <section className="section-block">
         <SectionHeading title="Outcomes by market and signal" detail={`${data.excluded_legacy_signals} legacy signals excluded, including signals generated before depth-unit corrections. Statistics require 10 measured observations.`} />
-        {data.outcomes_by_pair.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Signal</th><th>Horizon</th><th>Signals</th><th>Measured / missing / pending</th><th>Mean / median change</th><th>Positive / negative</th></tr></thead><tbody>
-          {data.outcomes_by_pair.map((item) => <tr key={`${item.pair}-${item.category}-${item.severity}-${item.horizon_minutes}`}><td>{shortPair(item.pair)}</td><td>{categoryLabel(item.category)} · {item.severity}</td><td>{formatHorizon(item.horizon_minutes)}</td><td>{item.signals}</td><td>{item.measured} / {item.missing} / {item.pending}</td><td>{item.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(item.mean_observed_change_percent)}% / ${formatNumber(item.median_observed_change_percent)}%`}</td><td>{item.positive_percent === null ? "N/A" : `${formatNumber(item.positive_percent)}% / ${formatNumber(item.negative_percent)}%`}</td></tr>)}
+        {data.outcomes_by_pair.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Signal</th><th>Horizon</th><th>Price basis</th><th>Signals</th><th>Measured / missing / pending</th><th>Mean / median change</th><th>Positive / negative</th></tr></thead><tbody>
+          {data.outcomes_by_pair.map((item) => <tr key={`${item.pair}-${item.category}-${item.severity}-${item.horizon_minutes}-${item.price_basis ?? "none"}`}><td>{shortPair(item.pair)}</td><td>{categoryLabel(item.category)} · {item.severity}</td><td>{formatHorizon(item.horizon_minutes)}</td><td>{priceBasisLabel(item.price_basis)}</td><td>{item.signals}</td><td>{item.measured} / {item.missing} / {item.pending}</td><td>{item.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(item.mean_observed_change_percent)}% / ${formatNumber(item.median_observed_change_percent)}%`}</td><td>{item.positive_percent === null ? "N/A" : `${formatNumber(item.positive_percent)}% / ${formatNumber(item.negative_percent)}%`}</td></tr>)}
         </tbody></table></div> : <EmptyState title="No current-engine signal outcomes" detail="Legacy signals are retained but are not compared with the current engine." compact />}
       </section>
       <section className="section-block">
@@ -499,8 +502,9 @@ function SignalDialog({ id, onClose }: { id: string; onClose: () => void }) {
           <div className="fact-block"><div className="fact-heading"><span className="fact-dot" />Observed facts <small>Persisted measurements</small></div><pre>{JSON.stringify(detail.observed_facts, null, 2)}</pre></div>
           <div className="fact-block interpretation-block"><div className="fact-heading"><span className="interpret-dot" />Interpretation <small>Rule-generated explanation</small></div><p>{detail.interpretation}</p></div>
           {detail.source?.explorer_url ? <a className="button button-secondary explorer-button" href={detail.source.explorer_url} target="_blank" rel="noreferrer">View Stellar transaction <ExternalLink size={14} /></a> : detail.source?.source_ref && <a className="button button-secondary explorer-button" href={detail.source.source_ref} target="_blank" rel="noreferrer">View source event <ExternalLink size={14} /></a>}
+          {detail.volume_evidence && <VolumeEvidencePanel evidence={detail.volume_evidence} />}
           <div className="section-block"><SectionHeading title="Subsequent price evaluation" detail="Observed price changes are not trading performance." />
-            {detail.evaluations.length ? <div className="evaluation-list">{detail.evaluations.map((evaluation) => <div className="evaluation-row" key={evaluation.horizon_minutes}><strong>{formatHorizon(evaluation.horizon_minutes)}</strong><span>{evaluation.status === "measured" ? `${formatNumber(evaluation.observed_change_percent)}%` : evaluation.status.replaceAll("_", " ")}</span><small>{evaluation.measured_at ? formatDateTime(evaluation.measured_at) : `Expected ${formatDateTime(evaluation.target_at)}`}</small><small>{evaluation.data_quality} · {evaluation.observation_count} observations</small></div>)}</div> : <EmptyState title="No evaluation horizons" detail="This signal has no associated price-evaluation record." compact />}
+            {detail.evaluations.length ? <div className="evaluation-list">{detail.evaluations.map((evaluation) => <div className="evaluation-row" key={evaluation.horizon_minutes}><strong>{formatHorizon(evaluation.horizon_minutes)}</strong><span>{evaluation.status === "measured" ? `${formatNumber(evaluation.observed_change_percent)}%` : evaluation.status.replaceAll("_", " ")}</span><small>{evaluation.measured_at ? formatDateTime(evaluation.measured_at) : `Expected ${formatDateTime(evaluation.target_at)}`}</small><small>{evaluation.data_quality} · {evaluation.observation_count} observations</small><small>Price basis: {evaluation.status === "measured" ? priceBasisLabel(evaluation.price_basis) : "none"}{evaluation.observation_ref ? ` · ${evaluation.observation_ref}` : ""}</small>{evaluation.missing_reason && <small>Missing: {evaluation.missing_reason.replaceAll("_", " ")}</small>}</div>)}</div> : <EmptyState title="No evaluation horizons" detail="This signal has no associated price-evaluation record." compact />}
           </div>
         </>
       ) : null}
@@ -699,4 +703,37 @@ function valueString(value: unknown): string | null {
 function shortAccount(value: string | null): string {
   if (!value) return "N/A";
   return value.length > 18 ? `${value.slice(0, 7)}…${value.slice(-5)}` : value;
+}
+
+function priceBasisLabel(basis?: string | null): string {
+  if (basis === "trade_price") return "Trade price (fallback)";
+  if (basis === "snapshot_mid") return "Order-book mid";
+  return basis ? basis.replaceAll("_", " ") : "N/A";
+}
+
+function VolumeEvidencePanel({ evidence }: { evidence: VolumeEvidence }) {
+  const venueNames: Record<string, string> = { order_book: "Order book", liquidity_pool: "Liquidity pool", unknown: "Venue not recorded" };
+  const coverage = evidence.coverage;
+  return (
+    <div className="section-block volume-evidence">
+      <SectionHeading title="Volume evidence" detail="Computed from persisted trades in the signal window." />
+      <div className="detail-facts">
+        <DetailField label="Trades" value={formatInteger(evidence.trade_count)} />
+        <DetailField label="Base volume" value={formatNumber(evidence.base_volume)} />
+        <DetailField label="Largest trade share" value={evidence.largest_trade_share_percent === null ? "N/A" : `${formatNumber(evidence.largest_trade_share_percent)}%`} />
+        <DetailField label="Venue coverage" value={`${coverage.venue_trades} / ${coverage.total_trades} trades`} />
+        {evidence.matches_signal_volume === false && <DetailField label="Warning" value="Stored trades do not sum to the signal volume" />}
+      </div>
+      <div className="evaluation-list">
+        {Object.entries(evidence.venues).filter(([, bucket]) => bucket.count > 0).map(([name, bucket]) => (
+          <div className="evaluation-row" key={name}><strong>{venueNames[name] ?? name}</strong><span>{formatNumber(bucket.base_volume)} base</span><small>{bucket.count} trades</small></div>
+        ))}
+      </div>
+      {evidence.largest_trades_by_base.length > 0 && <table><thead><tr><th>Largest trades</th><th>Time</th><th>Base</th><th>Quote</th><th>Venue</th></tr></thead><tbody>
+        {evidence.largest_trades_by_base.map((trade) => <tr key={trade.trade_id}><td>{trade.trade_id.split(":").pop()}</td><td>{formatDateTime(trade.occurred_at)}</td><td>{formatNumber(trade.base_amount)}</td><td>{formatNumber(trade.quote_amount)}</td><td>{venueNames[trade.venue ?? "unknown"] ?? trade.venue}</td></tr>)}
+      </tbody></table>}
+      {evidence.top_operations.length > 0 && <p><small>Top operations: {evidence.top_operations.map((op) => `${op.operation_id} (${formatNumber(op.base_volume)})`).join(", ")}</small></p>}
+      <p><small>{evidence.direction.note} Orientation coverage: {coverage.orientation_trades} / {coverage.total_trades} trades. {evidence.distinct_accounts !== null ? `${evidence.distinct_accounts} distinct accounts (identities hidden).` : "Account data not recorded."}</small></p>
+    </div>
+  );
 }

@@ -2,7 +2,7 @@ import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from stellar_intelligence_bot.chains.stellar.client import HorizonClient
+from stellar_intelligence_bot.chains.stellar.client import MALFORMED_RECORD_KEY, HorizonClient
 
 
 @pytest.mark.asyncio
@@ -113,7 +113,7 @@ async def test_temporary_rate_limit_is_retried() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("payload", [{}, {"_embedded": {"records": [None]}}])
+@pytest.mark.parametrize("payload", [{}, {"_embedded": {"records": "not-a-list"}}])
 async def test_malformed_records_are_not_treated_as_complete(
     payload: dict[str, object],
 ) -> None:
@@ -130,3 +130,23 @@ async def test_malformed_records_are_not_treated_as_complete(
                 _ = [record async for record in client.records("trades", cursor="1")]
     finally:
         await server.close()
+
+
+@pytest.mark.asyncio
+async def test_non_object_record_is_surfaced_as_marker_without_failing_the_page() -> None:
+    async def trades(_: web.Request) -> web.Response:
+        return web.json_response(
+            {"_embedded": {"records": [None, {"paging_token": "2"}]}}
+        )
+
+    app = web.Application()
+    app.router.add_get("/trades", trades)
+    server = TestServer(app)
+    await server.start_server()
+    try:
+        async with HorizonClient(str(server.make_url("/")).rstrip("/")) as client:
+            records = [record async for record in client.records("trades", cursor="1")]
+    finally:
+        await server.close()
+    assert MALFORMED_RECORD_KEY in records[0]
+    assert records[1] == {"paging_token": "2"}

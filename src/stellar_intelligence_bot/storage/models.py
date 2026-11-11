@@ -4,6 +4,7 @@ from datetime import datetime
 from decimal import Decimal
 
 from sqlalchemy import (
+    Boolean,
     DateTime,
     ForeignKey,
     Index,
@@ -89,6 +90,11 @@ class SignalEvaluationRecord(Base):
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     data_quality: Mapped[str] = mapped_column(String(32), nullable=False)
     evaluated_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    # NULL price_basis marks evaluations made before trade-price fallback existed (snapshot mid).
+    price_basis: Mapped[str | None] = mapped_column(String(24))
+    observation_ref: Mapped[str | None] = mapped_column(Text)
+    reference_observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    missing_reason: Mapped[str | None] = mapped_column(String(64))
 
 
 class CursorRecord(Base):
@@ -106,6 +112,12 @@ class RuntimeHealthRecord(Base):
     last_success_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
     last_error: Mapped[str | None] = mapped_column(Text)
+    consecutive_failures: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    interruption_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_interruption_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    skipped_trade_count: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    last_skipped_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
+    last_skipped_reason: Mapped[str | None] = mapped_column(Text)
 
 
 class TradeRecord(Base):
@@ -119,6 +131,18 @@ class TradeRecord(Base):
     quote_amount: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     price: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     source_ref: Mapped[str] = mapped_column(Text, nullable=False)
+    # Provenance columns are NULL for records ingested before migration 0005;
+    # NULL means "not recorded", never "false" or "unknown account".
+    venue: Mapped[str | None] = mapped_column(String(16))
+    base_is_seller: Mapped[bool | None] = mapped_column(Boolean)
+    base_asset: Mapped[str | None] = mapped_column(String(255))
+    counter_asset: Mapped[str | None] = mapped_column(String(255))
+    operation_id: Mapped[str | None] = mapped_column(String(64))
+    transaction_hash: Mapped[str | None] = mapped_column(String(64))
+    base_account: Mapped[str | None] = mapped_column(String(64))
+    counter_account: Mapped[str | None] = mapped_column(String(64))
+    liquidity_pool_id: Mapped[str | None] = mapped_column(String(64))
+    observed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True))
 
 
 class VolumeWindowRecord(Base):
