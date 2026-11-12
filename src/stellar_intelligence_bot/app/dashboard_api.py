@@ -14,10 +14,12 @@ from urllib.parse import quote, urlsplit, urlunsplit
 from fastapi import FastAPI, HTTPException, Path, Query, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel, Field
 from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from stellar_intelligence_bot.app.actionable import AssistantSettings
 from stellar_intelligence_bot.app.config import Settings
 from stellar_intelligence_bot.app.trade_evidence import account_diagnostics, trade_window_evidence
 from stellar_intelligence_bot.core.market_anomalies import (
@@ -30,8 +32,13 @@ from stellar_intelligence_bot.core.market_anomalies import (
 from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.storage.database import Database
 from stellar_intelligence_bot.storage.models import (
+    AssistantHeartbeatRecord,
+    AssistantSettingsRecord,
+    EpisodeReviewRecord,
     EventRecord,
     MarketSnapshotRecord,
+    OpportunityEvaluationRecord,
+    OpportunityRecord,
     RuntimeHealthRecord,
     SignalEvaluationRecord,
     SignalRecord,
@@ -41,6 +48,24 @@ from stellar_intelligence_bot.storage.models import (
 SeverityFilter = Literal["INFO", "WATCH", "HIGH", "CRITICAL"]
 CollectorStatus = Literal["healthy", "error", "stale", "starting", "not_started"]
 CategoryFilter = Annotated[str | None, Query(max_length=64, pattern=r"^[a-z][a-z0-9_]*$")]
+
+
+class EpisodeReviewBody(BaseModel):
+    status: Literal["reviewed", "dismissed"]
+    signal_count: int = Field(ge=1, le=100000)
+    max_severity: SeverityFilter
+    last_signal_at: datetime
+
+
+def _review(row: EpisodeReviewRecord) -> dict[str, object]:
+    return {
+        "episode_key": row.episode_key,
+        "status": row.status,
+        "reviewed_at": _iso(_as_utc(row.reviewed_at)),
+        "signal_count": row.signal_count,
+        "max_severity": row.max_severity,
+        "last_signal_at": _iso(_as_utc(row.last_signal_at)),
+    }
 
 
 def create_app(
@@ -99,6 +124,104 @@ def create_app(
                 }
             },
         )
+
+    @app.get("/api/assistant/settings")
+    async def assistant_settings(request: Request) -> dict[str, object]:
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                row = await session.get(AssistantSettingsRecord, 1)
+                return {"settings": row.settings if row else None}
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Signal settings are unavailable") from exc
+
+    @app.put("/api/assistant/settings")
+    async def save_assistant_settings(
+        request: Request, body: AssistantSettings
+    ) -> dict[str, object]:
+        config: Settings = request.app.state.settings
+        assets = {"native"} | {
+            asset.key for pair in config.monitored_pairs for asset in (pair.base, pair.quote)
+        }
+        if set(body.balances) - assets:
+            raise HTTPException(400, "Balances must refer to configured monitored assets")
+        db: Database = request.app.state.database
+        payload = body.model_dump(mode="json")
+        try:
+            async with db.sessions.begin() as session:
+                row = await session.get(AssistantSettingsRecord, 1)
+                if row is None:
+                    session.add(
+                        AssistantSettingsRecord(
+                            id=1, updated_at=datetime.now(UTC), settings=payload
+                        )
+                    )
+                else:
+                    row.settings = payload
+                    row.updated_at = datetime.now(UTC)
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Signal settings could not be saved") from exc
+        return {"settings": payload}
+
+    @app.get("/api/assistant/opportunities")
+    async def assistant_opportunities(request: Request) -> dict[str, object]:
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                heartbeat = await session.get(AssistantHeartbeatRecord, 1)
+                collector = await session.get(RuntimeHealthRecord, "collector")
+                configured = await session.get(AssistantSettingsRecord, 1) is not None
+                now = datetime.now(UTC)
+                healthy = heartbeat is not None and (
+                    now - _as_utc(heartbeat.last_success_at)
+                    <= timedelta(
+                        seconds=max(120, request.app.state.settings.poll_interval_seconds * 3)
+                    )
+                ) and _collector_status(collector, now, _stale_after(config)) == "healthy"
+                rows = (
+                    await session.scalars(
+                        select(OpportunityRecord)
+                        .order_by(OpportunityRecord.created_at.desc())
+                        .limit(100)
+                    )
+                ).all()
+                evaluations = (
+                    await session.scalars(
+                        select(OpportunityEvaluationRecord)
+                        .where(
+                            OpportunityEvaluationRecord.signal_id.in_(
+                                [row.signal_id for row in rows]
+                            )
+                        )
+                        .order_by(OpportunityEvaluationRecord.horizon_minutes)
+                    )
+                ).all()
+                return {
+                    "screening": "healthy" if healthy else "unavailable",
+                    "configured": configured,
+                    "items": [
+                        {
+                            "signal_id": row.signal_id,
+                            "pair": row.pair_key,
+                            "side": row.side,
+                            "created_at": _iso(_as_utc(row.created_at)),
+                            "expires_at": _iso(_as_utc(row.expires_at)),
+                            "parameters": row.parameters,
+                            "evaluations": [
+                                {
+                                    "minutes": item.horizon_minutes,
+                                    "status": item.status,
+                                    "result": item.result,
+                                }
+                                for item in evaluations
+                                if item.signal_id == row.signal_id
+                            ],
+                        }
+                        for row in rows
+                    ]
+                }
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Actionable signals are unavailable") from exc
 
     @app.get("/api/health", response_model=None)
     async def health(request: Request) -> dict[str, object] | JSONResponse:
@@ -361,6 +484,14 @@ def create_app(
             "pair": pair.key,
             "summary": summary,
             "history": history,
+            "latest_order_book_levels": (
+                {
+                    "observed_at": _iso(_as_utc(snapshots[0].observed_at)),
+                    "levels": snapshots[0].observed_facts["order_book_levels"],
+                }
+                if snapshots and "order_book_levels" in snapshots[0].observed_facts
+                else None
+            ),
             "volume_history": [
                 {"observed_at": key, "base_volume": _decimal(value)}
                 for key, value in sorted(volume_by_bucket.items())
@@ -489,6 +620,54 @@ def create_app(
             raise HTTPException(404, "Signal has no trade window")
         return account_diagnostics(trades)
 
+    @app.get("/api/episode-reviews")
+    async def episode_reviews(request: Request) -> dict[str, object]:
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                rows = (await session.scalars(select(EpisodeReviewRecord))).all()
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Review state is temporarily unavailable") from exc
+        return {"items": [_review(row) for row in rows]}
+
+    @app.put("/api/episode-reviews/{episode_key}")
+    async def put_episode_review(
+        request: Request,
+        body: EpisodeReviewBody,
+        episode_key: Annotated[str, Path(min_length=1, max_length=255)],
+    ) -> dict[str, object]:
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                row = await session.get(EpisodeReviewRecord, episode_key)
+                if row is None:
+                    row = EpisodeReviewRecord(episode_key=episode_key)
+                    session.add(row)
+                row.status = body.status
+                row.reviewed_at = datetime.now(UTC)
+                row.signal_count = body.signal_count
+                row.max_severity = body.max_severity
+                row.last_signal_at = _as_utc(body.last_signal_at)
+                await session.commit()
+                return _review(row)
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Review state could not be saved") from exc
+
+    @app.delete("/api/episode-reviews/{episode_key}")
+    async def delete_episode_review(
+        request: Request, episode_key: Annotated[str, Path(min_length=1, max_length=255)]
+    ) -> dict[str, object]:
+        db: Database = request.app.state.database
+        try:
+            async with db.sessions() as session:
+                row = await session.get(EpisodeReviewRecord, episode_key)
+                if row is not None:
+                    await session.delete(row)
+                    await session.commit()
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Review state could not be changed") from exc
+        return {"episode_key": episode_key, "status": "open"}
+
     @app.get("/api/activity")
     async def activity(
         request: Request,
@@ -563,9 +742,9 @@ def create_app(
         try:
             async with db.sessions() as session:
                 all_signals = await session.scalar(
-                    select(func.count()).select_from(SignalRecord).where(
-                        SignalRecord.occurred_at >= cutoff
-                    )
+                    select(func.count())
+                    .select_from(SignalRecord)
+                    .where(SignalRecord.occurred_at >= cutoff)
                 )
                 by_category = (
                     await session.execute(
@@ -785,14 +964,14 @@ async def _market_summary(
         volume, trade_count = (
             await session.execute(
                 select(func.sum(TradeRecord.base_amount), func.count()).where(
-                TradeRecord.pair_key == pair_key, TradeRecord.occurred_at >= cutoff
-            )
+                    TradeRecord.pair_key == pair_key, TradeRecord.occurred_at >= cutoff
+                )
             )
         ).one()
         snapshot_count = await session.scalar(
-            select(func.count()).select_from(MarketSnapshotRecord).where(
-                MarketSnapshotRecord.pair_key == pair_key
-            )
+            select(func.count())
+            .select_from(MarketSnapshotRecord)
+            .where(MarketSnapshotRecord.pair_key == pair_key)
         )
         latest_trade = await session.scalar(
             select(TradeRecord)
@@ -836,9 +1015,11 @@ async def _market_summary(
     ):
         rows = await database.book_observations(
             MarketPair.parse(pair_key),
-            observed_at - timedelta(
+            observed_at
+            - timedelta(
                 minutes=max(
-                    60, max(settings.price_windows_minutes) * 4,
+                    60,
+                    max(settings.price_windows_minutes) * 4,
                     (settings.volume_baseline_samples + 2) * 5,
                 )
             ),
@@ -846,7 +1027,9 @@ async def _market_summary(
         )
         books = [
             BookObservation(
-                _as_utc(row.observed_at), row.best_bid, row.best_ask,
+                _as_utc(row.observed_at),
+                row.best_bid,
+                row.best_ask,
                 trade_watermark(row.observed_facts),
             )
             for row in rows
@@ -856,11 +1039,17 @@ async def _market_summary(
         coverage = volume_coverage(books, observed_at, settings.volume_baseline_samples)
         if coverage is not None:
             volumes = await database.volume_windows(MarketPair.parse(pair_key), *coverage)
-            volume_ready = sum(
-                (value for start, value in volumes.items()
-                 if start < coverage[1] - timedelta(minutes=5)),
-                Decimal(0),
-            ) > 0
+            volume_ready = (
+                sum(
+                    (
+                        value
+                        for start, value in volumes.items()
+                        if start < coverage[1] - timedelta(minutes=5)
+                    ),
+                    Decimal(0),
+                )
+                > 0
+            )
         trade_coverage = volume_coverage(books, observed_at, 12)
         if trade_coverage is not None and MarketPair.parse(pair_key).base.code is None:
             trades = await database.trades_with_events(
@@ -928,8 +1117,7 @@ async def _market_summary(
             },
         },
         "last_trade_price": (
-            _decimal(latest_trade.price)
-            if latest_trade and latest_trade.quote_amount > 0 else None
+            _decimal(latest_trade.price) if latest_trade and latest_trade.quote_amount > 0 else None
         ),
         "last_trade_at": _iso(_as_utc(latest_trade.occurred_at)) if latest_trade else None,
         "best_bid": _decimal(latest.best_bid) if latest else None,
@@ -1061,9 +1249,7 @@ async def _window_trades(session: AsyncSession, signal: SignalRecord) -> list[Tr
     )
 
 
-async def _volume_evidence(
-    session: AsyncSession, signal: SignalRecord
-) -> dict[str, object] | None:
+async def _volume_evidence(session: AsyncSession, signal: SignalRecord) -> dict[str, object] | None:
     trades = await _window_trades(session, signal)
     if trades is None:
         return None
@@ -1101,6 +1287,8 @@ def _evaluation(row: SignalEvaluationRecord) -> dict[str, object]:
         if row.reference_observed_at
         else None,
         "missing_reason": _missing_reason(row),
+        "sampled_max_increase_percent": _decimal(row.max_increase_percent),
+        "sampled_max_decrease_percent": _decimal(row.max_decrease_percent),
     }
 
 

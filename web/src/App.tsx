@@ -16,6 +16,7 @@ import {
   RefreshCw,
   Search,
   Sun,
+  Wallet,
   Waves,
   X,
 } from "lucide-react";
@@ -33,7 +34,13 @@ import {
   YAxis,
 } from "recharts";
 import { ExplanationBody, SeverityTag, SignalCard } from "./SignalCards";
-import { categoryTitle, explainSignal, marketSummary, pairNames, rankSignals, severityInfo } from "./explain";
+import { categoryTitle, explainSignal, pairNames, severityInfo } from "./explain";
+import { EpisodeCard } from "./EpisodeCards";
+import { PortfolioSettings } from "./Portfolio";
+import { Opportunities } from "./Opportunities";
+import { buildEpisodes, placeEpisodes } from "./episodes";
+import type { Episode } from "./episodes";
+import { useEpisodeData } from "./useEpisodeData";
 import {
   Activity,
   Analytics,
@@ -48,11 +55,12 @@ import {
   VolumeEvidence,
 } from "./api";
 
-type View = "Overview" | "Markets" | "Signals" | "Activity" | "Analytics";
+type View = "Overview" | "Portfolio" | "Markets" | "Signals" | "Activity" | "Analytics";
 type Data = Overview | Market[] | PageResult<Signal> | PageResult<Activity> | Analytics;
 
 const navigation: { name: View; icon: typeof LayoutDashboard }[] = [
   { name: "Overview", icon: LayoutDashboard },
+  { name: "Portfolio", icon: Wallet },
   { name: "Markets", icon: Waves },
   { name: "Signals", icon: BellRing },
   { name: "Activity", icon: ActivityIcon },
@@ -82,7 +90,7 @@ export default function App() {
   const [selectedPair, setSelectedPair] = useState<string | null>(null);
 
   const route = useMemo(() => {
-    if (view === "Overview") return "/api/overview";
+    if (view === "Overview" || view === "Portfolio") return "/api/overview";
     if (view === "Markets") return "/api/markets";
     if (view === "Signals")
       return `/api/signals${queryString({
@@ -156,7 +164,7 @@ export default function App() {
           <span className="brand-mark"><Waves size={19} /></span>
           <span><strong>Stellar</strong><small>INTELLIGENCE</small></span>
         </a>
-        <div className="nav-label">WORKSPACE</div>
+        <div className="nav-label">OVERVIEW &amp; TECHNICAL VIEWS</div>
         <nav aria-label="Main navigation">
           {navigation.map(({ name, icon: Icon }) => (
             <button
@@ -208,6 +216,7 @@ export default function App() {
           ) : (
             <>
               {view === "Overview" && <OverviewPage data={currentData as Overview} onSignal={openSignal} onPair={openPair} onSignals={() => setView("Signals")} />}
+              {view === "Portfolio" && <PortfolioSettings pairs={(currentData as Overview).monitored_pairs} />}
               {view === "Markets" && <MarketsPage data={currentData as Market[]} onPair={openPair} />}
               {view === "Signals" && (
                 <SignalsPage
@@ -293,34 +302,102 @@ function dataQualityIssues(data: Overview): string[] {
   return issues;
 }
 
-function OverviewPage({ data, onSignal, onPair, onSignals }: { data: Overview; onSignal: (id: string) => void; onPair: (pair: string) => void; onSignals: () => void }) {
-  const headline = STATUS_HEADLINES[data.collector.status] ?? { title: "Monitoring status is unknown", tone: "warn" };
-  const issues = dataQualityIssues(data);
-  const ranked = rankSignals(data.recent_signals);
-  const notable = data.counts.notable_events_24h ?? 0;
-  const marketCount = data.monitored_pairs.length;
+const PERIODS = [{ days: 1, label: "Last 24 hours" }, { days: 7, label: "Last 7 days" }, { days: 30, label: "Last 30 days" }];
+const ATTENTION_LIMIT = 5;
+
+function OverviewPage(props: { data: Overview; onSignal: (id: string) => void; onPair: (pair: string) => void; onSignals: () => void }) {
+  const [diagnosticsOpen, setDiagnosticsOpen] = useState(false);
+  const { data } = props;
+  const dataProblem = data.collector.status !== "healthy" || data.database.status !== "healthy" || data.warnings.length > 0;
   return (
     <>
-      <PageHeading eyebrow="STELLAR MARKET INTELLIGENCE" title="What is happening in the market" detail="Unusual activity on the monitored Stellar markets, explained in plain language. This is not trading advice." />
-      <section className={`panel summary-banner tone-${headline.tone}`} aria-label="Market summary">
+      <PageHeading eyebrow="STELLAR SIGNALS" title="Your signal assistant" detail="No orders are placed. Signals require sufficient evidence and estimated costs." />
+      {dataProblem && <div className="notice notice-warning" role="status"><AlertTriangle size={16} /><span>Market data may be incomplete or delayed. See technical diagnostics for details.</span></div>}
+      <Opportunities />
+      <details className="section-block technical-details" onToggle={(event) => setDiagnosticsOpen(event.currentTarget.open)}>
+        <summary>Technical diagnostics</summary>
+        {diagnosticsOpen && <DiagnosticsOverview {...props} />}
+      </details>
+    </>
+  );
+}
+
+function DiagnosticsOverview({ data, onSignal, onPair, onSignals }: { data: Overview; onSignal: (id: string) => void; onPair: (pair: string) => void; onSignals: () => void }) {
+  const headline = STATUS_HEADLINES[data.collector.status] ?? { title: "Monitoring status is unknown", tone: "warn" };
+  const issues = dataQualityIssues(data);
+  const [days, setDays] = useState(7);
+  const [showAll, setShowAll] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
+  const loaded = useEpisodeData(days, 30);
+  const marketCount = data.monitored_pairs.length;
+  const signals = loaded.signals ?? data.recent_signals;
+  const placed = useMemo(() => {
+    const episodes = buildEpisodes(signals, { now: Date.now(), collectorHealthy: data.collector.status === "healthy" });
+    return placeEpisodes(episodes, loaded.reviews);
+  }, [signals, loaded.reviews, data.collector.status]);
+  const attention = placed.filter((item) => item.placement === "attention");
+  const quiet = placed.filter((item) => item.placement === "quiet");
+  const closed = placed.filter((item) => item.placement === "closed");
+  const investigate = attention.filter((item) => item.episode.action === "investigate").length;
+  const shown = showAll ? attention : attention.slice(0, ATTENTION_LIMIT);
+
+  const guard = (action: () => Promise<void>) => async () => {
+    try {
+      setActionError(null);
+      await action();
+    } catch (reason) {
+      setActionError(reason instanceof Error ? reason.message : "Could not save this change");
+    }
+  };
+  const onReview = (episode: Episode, status: "reviewed" | "dismissed") => guard(() => loaded.review(episode, status))();
+  const onReopen = (episode: Episode) => guard(() => loaded.reopen(episode))();
+  const summary =
+    attention.length === 0
+      ? "Nothing needs your attention right now. You can safely ignore the remaining events."
+      : investigate > 0
+        ? `${investigate} market episode${investigate === 1 ? " is" : "s are"} worth a manual review. Everything else can wait.`
+        : `Nothing needs urgent review. ${attention.length} episode${attention.length === 1 ? " is" : "s are"} worth keeping an eye on.`;
+
+  return (
+    <>
+      <PageHeading eyebrow="STELLAR MARKET INTELLIGENCE" title="What needs your attention?" detail="Related signals are grouped into market episodes. This is monitoring information, not trading advice." />
+      <section className={`panel summary-banner tone-${headline.tone}`} aria-label="Monitoring status">
         <div className="summary-status"><span className={`status-dot ${headline.tone}`} /><strong>{headline.title}</strong><small>{data.collector.last_success_at ? `Latest data collected ${relativeTime(data.collector.last_success_at)}.` : "No data has been collected yet."}</small></div>
-        <p>{marketSummary(notable, ranked.filter((item) => new Date(item.occurred_at).getTime() > Date.now() - 24 * 3600 * 1000), marketCount)}</p>
+        <p>{summary}</p>
       </section>
       <div className="metric-grid">
-        <MetricCard title="Is monitoring working?" value={headline.title.replace("Monitoring ", "").replace(/^is /, "")} detail={data.data_freshness_seconds === null ? "No data observed yet" : `Newest data is ${formatDuration(data.data_freshness_seconds)} old`} icon={<ActivityIcon size={17} />} />
+        <MetricCard title="Monitoring health" value={headline.title.replace("Monitoring ", "").replace(/^is /, "")} detail={data.data_freshness_seconds === null ? "No data observed yet" : `Newest data is ${formatDuration(data.data_freshness_seconds)} old`} icon={<ActivityIcon size={17} />} />
         <MetricCard title="Markets monitored" value={formatInteger(marketCount)} detail="Stellar markets we are watching" icon={<Waves size={17} />} />
-        <MetricCard title="Notable events, last 24 hours" value={formatInteger(notable)} detail="Events rated Watch or higher" icon={<BellRing size={17} />} />
-        <MetricCard title="Data-quality issues" value={formatInteger(issues.length)} detail={issues.length ? "Listed below" : "None detected"} icon={<AlertTriangle size={17} />} />
+        <MetricCard title="Market episodes" value={formatInteger(placed.length)} detail={`Grouped from ${formatInteger(signals.length)} individual signals`} icon={<BellRing size={17} />} />
+        <MetricCard title="Need your attention" value={formatInteger(attention.length)} detail={attention.length ? `${investigate} to investigate` : "Nothing to review"} icon={<AlertTriangle size={17} />} />
+      </div>
+      <div className="period-picker" role="group" aria-label="Period">
+        {PERIODS.map((item) => <button key={item.days} className={`button button-secondary ${days === item.days ? "active" : ""}`} aria-pressed={days === item.days} onClick={() => setDays(item.days)}>{item.label}</button>)}
       </div>
       {issues.length > 0 && (
-        <div className="warning-list" aria-label="Data-quality issues">
+        <div className="warning-list" aria-label="Data-quality warnings">
           {issues.map((issue) => <div className="notice notice-warning" key={issue}><AlertTriangle size={16} /><span>{issue}</span></div>)}
         </div>
       )}
+      {loaded.signals === null && <div className="notice notice-warning"><AlertTriangle size={16} /><span>Full signal history could not be loaded, so only the most recent signals are grouped.</span></div>}
+      {!loaded.reviewsAvailable && <div className="notice notice-warning"><AlertTriangle size={16} /><span>Review state could not be loaded; previously reviewed episodes may reappear.</span></div>}
+      {loaded.truncated && <div className="notice notice-warning"><AlertTriangle size={16} /><span>Only the newest 500 signals in this period were grouped. Choose a shorter period for a complete view.</span></div>}
+      {actionError && <div className="notice notice-warning" role="alert"><AlertTriangle size={16} /><span>{actionError}</span></div>}
       <section className="section-block">
-        <SectionHeading title="Events that deserve attention" detail="Ordered by: last 24 hours first, then severity, then newest. Each card explains what happened, how unusual it was and what we do not know." linkText="All events" onLink={onSignals} />
-        {ranked.length ? <div className="card-list">{ranked.slice(0, 5).map((item) => <SignalCard key={item.signal_id} signal={item} onOpen={onSignal} />)}</div> : <EmptyState title="No notable events yet" detail="Events will appear here when market activity differs clearly from its recent history." compact />}
+        <SectionHeading title="What needs your attention?" detail="Ordered by recommended action, then severity, then evidence quality, then recency." linkText="All individual signals" onLink={onSignals} />
+        {attention.length ? (
+          <div className="card-list">{shown.map((item) => <EpisodeCard key={item.episode.key} placed={item} onOpenSignal={onSignal} onReview={onReview} onReopen={onReopen} />)}</div>
+        ) : <EmptyState title="No action needed" detail="No market episode currently needs a human review. Keep monitoring." compact />}
+        {attention.length > ATTENTION_LIMIT && <button className="button button-secondary" onClick={() => setShowAll(!showAll)}>{showAll ? "Show fewer" : `Show all ${attention.length} episodes`}</button>}
       </section>
+      <details className="section-block technical-details">
+        <summary>No action needed ({quiet.length})</summary>
+        {quiet.length ? <ul className="quiet-list">{quiet.map((item) => <li key={item.episode.key}><strong>{item.episode.title}</strong> — {item.episode.signals.length} signal{item.episode.signals.length === 1 ? "" : "s"}, latest {relativeTime(new Date(item.episode.end).toISOString())}. <button className="text-button" onClick={() => onSignal(item.episode.primary.signal_id)}>Details</button></li>)}</ul> : <p className="muted">Nothing here.</p>}
+      </details>
+      <details className="section-block technical-details">
+        <summary>Reviewed or dismissed ({closed.length})</summary>
+        {closed.length ? <div className="card-list">{closed.map((item) => <EpisodeCard key={item.episode.key} placed={item} onOpenSignal={onSignal} onReview={onReview} onReopen={onReopen} />)}</div> : <p className="muted">Nothing here. Reviewing an episode never deletes its signals or evidence.</p>}
+      </details>
       <section className="section-block">
         <SectionHeading title="Monitored markets" detail="Latest persisted order-book observations" />
         {data.markets.length ? <MarketTable markets={data.markets} onPair={onPair} /> : <EmptyState title="No markets configured" detail="Set BOT_WATCHLIST_ENABLED or BOT_MONITORED_PAIRS to begin collecting market observations." compact />}
@@ -531,13 +608,13 @@ function SignalDialog({ id, onClose }: { id: string; onClose: () => void }) {
         <>
           <div className="detail-title"><div><div className="eyebrow">{categoryTitle(detail.category)} · {pairNames(detail.pair).label}</div><h2>{explanation.title}</h2></div><SeverityTag value={detail.severity} /></div>
           <p className="story-note">{severityInfo(detail.severity).meaning} {formatDateTime(detail.occurred_at)}.</p>
+          <details className="section-block technical-details">
+          <summary>Evidence and technical details</summary>
           <ExplanationBody explanation={explanation} />
           <div className="section-block"><SectionHeading title="Evidence" detail="The measurements behind this explanation." />
             {detail.volume_evidence && <VolumeEvidencePanel evidence={detail.volume_evidence} />}
             {chartData.length ? <ChartCard title="Observed price change after the event" detail="Percentage change of the price per measured time. Not profit, and not proof of cause."><ResponsiveContainer width="100%" height={190}><BarChart data={chartData}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="horizon" /><YAxis width={46} unit="%" /><Tooltip /><Bar dataKey="change" name="Price change (%)" fill="var(--blue)" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer></ChartCard> : <EmptyState title="No price changes measured yet" detail="Unmeasured is not the same as unchanged." compact />}
           </div>
-          <details className="section-block technical-details">
-            <summary>Technical details</summary>
             <div className="detail-facts"><DetailField label="Timestamp" value={formatDateTime(detail.occurred_at)} /><DetailField label="Confidence" value={detail.confidence} /><DetailField label="Expires" value={formatDateTime(detail.expires_at)} /><DetailField label="Source event" value={detail.source?.event_id ?? "N/A"} /><DetailField label="Signal ID" value={detail.signal_id} /><DetailField label="Deduplication key" value={detail.deduplication_key} /></div>
             <div className="fact-block"><div className="fact-heading"><span className="fact-dot" />Observed facts <small>Persisted measurements</small></div><pre>{JSON.stringify(detail.observed_facts, null, 2)}</pre></div>
             <div className="fact-block interpretation-block"><div className="fact-heading"><span className="interpret-dot" />Rule description <small>Generated by the detection rule</small></div><p>{detail.interpretation}</p></div>
@@ -590,6 +667,13 @@ function MarketDialog({ pair, onClose, onSignal }: { pair: string; onClose: () =
         <div className="section-block"><SectionHeading title="Recent order-book snapshots" detail="Observed best prices, spread and depth; no reconstruction." />
           {detail.history.length ? detail.history.slice(-10).reverse().map((item, index) => <p key={`${item.observed_at}-${index}`}>{formatDateTime(item.observed_at)} · bid {formatNumber(item.best_bid)} · ask {formatNumber(item.best_ask)} · spread {formatNumber(item.spread_percent)}% · depth {formatNumber(item.bid_depth)} / {formatNumber(item.ask_depth)}</p>) : <p>No persisted snapshots.</p>}
         </div>
+        <details className="section-block technical-details">
+          <summary>Latest recorded order-book levels</summary>
+          <p>These are sampled levels, not proof of executable liquidity. Prices and amounts use the units recorded below; levels may have changed or disappeared.</p>
+          {detail.latest_order_book_levels
+            ? <div className="fact-block"><p>Observed {formatDateTime(detail.latest_order_book_levels.observed_at)}.</p><pre>{JSON.stringify(detail.latest_order_book_levels.levels, null, 2)}</pre></div>
+            : <p>The latest snapshot has no recorded levels, or no snapshot is available.</p>}
+        </details>
       </>}
     </Dialog>
   );

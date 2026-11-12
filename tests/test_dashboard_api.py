@@ -6,6 +6,7 @@ from decimal import Decimal
 import pytest
 from httpx import ASGITransport, AsyncClient
 
+from stellar_intelligence_bot.app.actionable import process_ideas
 from stellar_intelligence_bot.app.config import Settings
 from stellar_intelligence_bot.app.dashboard_api import create_app
 from stellar_intelligence_bot.core.markets import MarketPair
@@ -21,6 +22,33 @@ from stellar_intelligence_bot.storage.models import (
 ISSUER = "GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF"
 PAIR = f"native/USDC:{ISSUER}"
 TX_HASH = "a" * 64
+
+
+@pytest.mark.asyncio
+async def test_assistant_settings_persist_and_screening_health_is_explicit(tmp_path) -> None:
+    config = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
+    payload = {
+        "balances": {"native": "100", f"USDC:{ISSUER}": "50"},
+        "reserve": "10", "fee": "0.001", "allocation": "5",
+        "min_movement_percent": "1", "minimum_severity": "WATCH",
+    }
+    async with _api(str(tmp_path / "assistant.db"), config) as (client, db):
+        response = await client.get("/api/assistant/opportunities")
+        assert response.json()["screening"] == "unavailable"
+        assert response.json()["configured"] is False
+        assert (await client.put("/api/assistant/settings", json=payload)).status_code == 200
+        assert (await client.get("/api/assistant/settings")).json()["settings"]["balances"] == (
+            payload["balances"]
+        )
+        now = datetime.now(UTC)
+        await db.record_health(started_at=now, successful=True, now=now)
+        await process_ideas(db, config.monitored_pairs, now)
+        response = (await client.get("/api/assistant/opportunities")).json()
+        assert response["screening"] == "healthy"
+        assert response["configured"] is True
+        assert response["items"] == []
+        bad = payload | {"balances": {"native": "0"}}
+        assert (await client.put("/api/assistant/settings", json=bad)).status_code == 422
 
 
 @asynccontextmanager
@@ -180,8 +208,39 @@ async def test_missing_market_observations_and_stale_persisted_data(tmp_path) ->
     assert Decimal(stale["latest_price"]) == Decimal("10")
     assert detail.status_code == 200
     assert Decimal(detail.json()["history"][0]["price"]) == Decimal("10")
+    assert detail.json()["latest_order_book_levels"] is None
     assert overview["collector"]["status"] == "stale"
     assert "collector_stale" in {item["code"] for item in overview["warnings"]}
+
+
+@pytest.mark.asyncio
+async def test_market_detail_returns_latest_levels_without_stale_fallback(tmp_path) -> None:
+    settings = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
+    levels = {
+        "version": 1, "bid_amount_units": "quote", "ask_amount_units": "base",
+        "bids": [{"price": "0.5", "amount": "10"}], "asks": [],
+    }
+    async with _api(str(tmp_path / "levels.db"), settings) as (client, database):
+        now = datetime.now(UTC)
+        async with database.sessions.begin() as session:
+            session.add(MarketSnapshotRecord(
+                pair_key=PAIR, observed_at=now - timedelta(minutes=2),
+                best_bid=Decimal("0.5"), best_ask=Decimal("0.6"),
+                bid_depth=Decimal(20), ask_depth=Decimal(0),
+                observed_facts={"order_book_levels": levels},
+            ))
+        detail = (await client.get(f"/api/markets/{PAIR}")).json()
+        assert detail["latest_order_book_levels"] == {
+            "observed_at": (now - timedelta(minutes=2)).isoformat().replace("+00:00", "Z"),
+            "levels": levels,
+        }
+        async with database.sessions.begin() as session:
+            session.add(MarketSnapshotRecord(
+                pair_key=PAIR, observed_at=now, best_bid=None, best_ask=None,
+                bid_depth=Decimal(0), ask_depth=Decimal(0), observed_facts={},
+            ))
+        detail = (await client.get(f"/api/markets/{PAIR}")).json()
+        assert detail["latest_order_book_levels"] is None
 
 
 @pytest.mark.asyncio
@@ -392,3 +451,34 @@ async def test_account_diagnostics_are_opt_in(tmp_path) -> None:
         response = await client.get(f"/api/signals/{signal_id}/account-diagnostics")
     assert response.status_code == 200
     assert "GACCOUNTSECRET" in response.text
+
+
+@pytest.mark.asyncio
+async def test_episode_review_roundtrip_leaves_signals_untouched(tmp_path) -> None:
+    async with _api(str(tmp_path / "reviews.db"), Settings()) as (client, _):
+        assert (await client.get("/api/episode-reviews")).json() == {"items": []}
+        body = {
+            "status": "reviewed",
+            "signal_count": 3,
+            "max_severity": "HIGH",
+            "last_signal_at": "2026-01-01T10:00:00Z",
+        }
+        saved = await client.put("/api/episode-reviews/sig-1", json=body)
+        assert saved.status_code == 200
+        assert saved.json()["status"] == "reviewed"
+        body["status"] = "dismissed"
+        await client.put("/api/episode-reviews/sig-1", json=body)
+        items = (await client.get("/api/episode-reviews")).json()["items"]
+        assert [(i["episode_key"], i["status"], i["signal_count"]) for i in items] == [
+            ("sig-1", "dismissed", 3)
+        ]
+        bad = await client.put("/api/episode-reviews/sig-1", json={**body, "status": "deleted"})
+        assert bad.status_code == 422
+        assert (await client.delete("/api/episode-reviews/sig-1")).json()["status"] == "open"
+        assert (await client.get("/api/episode-reviews")).json() == {"items": []}
+
+
+@pytest.mark.asyncio
+async def test_removed_calculator_endpoint_is_unavailable(tmp_path) -> None:
+    async with _api(str(tmp_path / "removed.db"), Settings()) as (client, _):
+        assert (await client.post("/api/paper-scenarios", json={})).status_code == 404

@@ -104,6 +104,26 @@ mypy src
 - Signal severity is rule-based. A transfer at least ten times its configured threshold is `HIGH`; other configured transfer breaches are `WATCH`. Market anomaly and order-book rules currently emit `WATCH`, except an extreme volume breach (at least three times its configured trigger), which emits `HIGH`.
 - Signals expire after 30 minutes and matching deduplication keys have a 15-minute cooldown.
 
+## Market episodes and review state
+
+The dashboard overview groups individual signals into market episodes in the browser (`web/src/episodes.ts`); no signal is changed or hidden. Signals are grouped only when they share the exact same market (pair and issuers) and are close in time: the same signal type within 30 minutes, or different types within 10 minutes of each other (measurement windows are used when stored). An episode spans at most 6 hours. Trade and operation IDs are not stored on signals, so they are not used for grouping.
+
+Recommended human actions are rule-based: *Investigate* needs a High or Critical signal (or two signal families at Watch or above) in the last 6 hours with usable stored measurements; a lone large trade is never escalated on size alone. *Monitor* covers recent lower-severity activity, *Informational* covers old or low-severity episodes, and episodes without stored measurements get "no recommendation". These are prompts for human review, never trading advice.
+
+Marking an episode reviewed or dismissed is stored in the `episode_reviews` table (migration `0006_episode_reviews`, a new table only) through `GET /api/episode-reviews`, `PUT`/`DELETE /api/episode-reviews/{episode_key}`. A reviewed episode returns to the attention list only if later evidence has a higher severity; dismissed episodes stay closed. The write endpoints have no authentication, like the rest of the dashboard API, so keep it on a trusted network.
+
+## Actionable signals
+
+The assistant applies the configurable, **unvalidated** `momentum-v1` rule to fresh price-movement anomalies: an upward movement proposes BUY, and a downward movement proposes SELL. It only uses signals produced after settings were saved, within two minutes of their source snapshot. It requires a two-sided book and enough recorded best-level liquidity for the proposed quantity. Only pairs with XLM as the base are currently supported. The rule is exploratory and does not establish a trading edge.
+
+Portfolio settings persist in PostgreSQL under exact asset identities. The allocation percentage limits the available asset balance, not total portfolio value. XLM reserve and two user-assumed network fees are held back when sizing a SELL. The target models the entry bid/ask and converts the two assumed XLM fees using the observed bid; it aims for at least 1% on the quote amount after these assumptions. Actual fees, future spread and slippage remain unknown, so the target and profit are estimates, not verified net returns. No AMM route or fill is simulated.
+
+Each emitted idea retains its original parameters and references. Follow-up samples bid/ask conditions at 5 and 10 minutes, 1, 4 and 24 hours, and 7 days. A horizon without a valid observation in its final two minutes is unknown; gaps can hide price movements even when an endpoint exists. An observed entry or target is not proof of executable liquidity, an executed transaction, or realized profit. Screening runs in the collector; the overview warns when its heartbeat is stale. Historical observations depend on collector uptime and retention.
+
+New order-book snapshots retain the individual levels returned by the existing Horizon request (up to 20 per side) in snapshot facts, with price units, original amount units and rational prices when provided. The market detail API exposes the latest snapshot's levels when recorded, and the market detail dialog displays them under **Latest recorded order-book levels**. Earlier snapshots do not contain these levels. A snapshot is not a guarantee of liquidity at execution time and does not provide queue priority, network fee estimates or AMM reserves.
+
+The API has no authentication. Anyone with access to it can read and modify persisted portfolio balances and settings; run it only on a trusted network. No wallet access or keys are used.
+
 ## Signal evaluation
 
 Market signals with a pair and a valid two-sided reference snapshot record their midpoint at signal time. The collector evaluates the first valid two-sided order-book midpoint at or after 5 minutes, 15 minutes, 1 hour, 4 hours, and 24 hours. An observation must arrive within five minutes after the target; otherwise the result is recorded as missing rather than substituted with stale data. Evaluation runs continuously with collection, so the service must remain running for later horizons to complete.

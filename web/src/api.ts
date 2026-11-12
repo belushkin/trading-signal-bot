@@ -50,6 +50,8 @@ export type SignalEvaluation = {
   observation_ref?: string | null;
   reference_observed_at?: string | null;
   missing_reason?: string | null;
+  sampled_max_increase_percent?: string | null;
+  sampled_max_decrease_percent?: string | null;
 };
 
 export type PageResult<T> = { items: T[]; total: number; limit: number; offset: number };
@@ -138,6 +140,7 @@ export type Activity = {
 export type MarketDetail = {
   pair: string;
   summary: Market;
+  latest_order_book_levels?: { observed_at: string; levels: unknown } | null;
   history: { observed_at: string; price: string | null; bid_depth: string | null; ask_depth: string; best_bid: string | null; best_ask: string | null; spread_percent: string | null }[];
   volume_history: { observed_at: string; base_volume: string }[];
   recent_trades: { occurred_at: string; price: string | null; base_amount: string; quote_amount: string; trade_type: string | null }[];
@@ -205,4 +208,17 @@ export function queryString(values: Record<string, string | number | undefined>)
   }
   const query = params.toString();
   return query ? `?${query}` : "";
+}
+
+export async function send<T>(path: string, method: "POST" | "PUT" | "DELETE", body?: unknown): Promise<T> {
+  const response = await fetch(path, {
+    method,
+    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!response.ok) {
+    const payload = await response.json().catch(() => null);
+    throw new Error(payload?.error?.message ?? `Request failed (${response.status})`);
+  }
+  return response.json() as Promise<T>;
 }

@@ -16,6 +16,7 @@ from alembic import command
 from alembic.config import Config
 from sqlalchemy.exc import SQLAlchemyError
 
+from stellar_intelligence_bot.app.actionable import process_ideas
 from stellar_intelligence_bot.app.config import Settings
 from stellar_intelligence_bot.app.logging_config import configure_logging
 from stellar_intelligence_bot.chains.stellar.client import MALFORMED_RECORD_KEY, HorizonClient
@@ -45,6 +46,7 @@ async def run() -> None:
     stop_requested = asyncio.Event()
     for stop_signal in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(stop_signal, stop_requested.set)
+    assistant_task = asyncio.create_task(_run_assistant(database, settings, stop_requested))
     try:
         async with HorizonClient(settings.horizon_url) as client:
             collector = StellarCollector(client, settings.monitored_pairs, database)
@@ -105,9 +107,20 @@ async def run() -> None:
                 await collector.close()
                 logger.info("Collector stopped cleanly")
     finally:
+        stop_requested.set()
+        await assistant_task
         await database.close()
         for stop_signal in (signal.SIGINT, signal.SIGTERM):
             loop.remove_signal_handler(stop_signal)
+
+
+async def _run_assistant(database: Database, settings: Settings, stop: asyncio.Event) -> None:
+    while not stop.is_set():
+        try:
+            await process_ideas(database, settings.monitored_pairs, datetime.now(UTC))
+        except (SQLAlchemyError, ValueError):
+            logger.exception("Actionable signal processing failed; will retry")
+        await _wait_for_stop(stop, settings.poll_interval_seconds)
 
 
 def main() -> None:

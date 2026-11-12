@@ -112,6 +112,33 @@ class EventProcessor:
         best_ask = _optional_decimal(attrs.get("best_ask"))
         bid_depth = _optional_decimal(attrs.get("bid_depth_base")) or Decimal(0)
         ask_depth = _optional_decimal(attrs.get("ask_depth_base")) or Decimal(0)
+        snapshot_facts: dict[str, object] = dict(attrs)
+        if item.order_book_levels is not None:
+            snapshot_facts["order_book_levels"] = {
+                "version": 1,
+                "price_units": "quote_per_base",
+                "bid_amount_units": "quote",
+                "ask_amount_units": "base",
+                "requested_limit": 20,
+                "bids": [
+                    {
+                        "price": level.price,
+                        "amount": level.amount,
+                        "price_numerator": level.price_numerator,
+                        "price_denominator": level.price_denominator,
+                    }
+                    for level in item.order_book_levels.bids
+                ],
+                "asks": [
+                    {
+                        "price": level.price,
+                        "amount": level.amount,
+                        "price_numerator": level.price_numerator,
+                        "price_denominator": level.price_denominator,
+                    }
+                    for level in item.order_book_levels.asks
+                ],
+            }
         inserted = await self.database.save_market_snapshot(
             event,
             pair,
@@ -120,7 +147,7 @@ class EventProcessor:
             best_ask,
             bid_depth,
             ask_depth,
-            dict(attrs),
+            snapshot_facts,
         )
         if not inserted:
             return

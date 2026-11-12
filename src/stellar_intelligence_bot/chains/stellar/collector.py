@@ -9,7 +9,12 @@ from decimal import Decimal, InvalidOperation
 from typing import Any, Protocol
 from urllib.parse import urlencode
 
-from stellar_intelligence_bot.chains.base import CollectedEvent, TradeProvenance
+from stellar_intelligence_bot.chains.base import (
+    CollectedEvent,
+    OrderBookLevel,
+    OrderBookLevels,
+    TradeProvenance,
+)
 from stellar_intelligence_bot.chains.stellar.client import MALFORMED_RECORD_KEY, HorizonClient
 from stellar_intelligence_bot.core.events import Chain, ChainEvent
 from stellar_intelligence_bot.core.markets import MarketPair
@@ -187,7 +192,15 @@ class StellarCollector:
             source_ref=source_ref,
             attributes=trade_facts,
         )
-        return CollectedEvent(event, pair=pair, is_market_snapshot=True)
+        return CollectedEvent(
+            event,
+            pair=pair,
+            is_market_snapshot=True,
+            order_book_levels=OrderBookLevels(
+                bids=_level_evidence(payload.get("bids", []), raw_bids),
+                asks=_level_evidence(payload.get("asks", []), asks),
+            ),
+        )
 
     async def close(self) -> None:
         await self.client.close()
@@ -362,6 +375,27 @@ def _parse_order_levels(values: object, field: str) -> list[tuple[Decimal, Decim
             raise ValueError(f"Invalid order-book {field} price or amount")
         levels.append((price, amount))
     return levels
+
+
+def _level_evidence(
+    values: object, parsed: list[tuple[Decimal, Decimal]]
+) -> tuple[OrderBookLevel, ...]:
+    if not isinstance(values, list) or len(values) != len(parsed):
+        raise ValueError("Order-book levels changed after validation")
+    result = []
+    for level, (price, amount) in zip(values, parsed, strict=True):
+        if not isinstance(level, Mapping):
+            raise ValueError("Malformed order-book level")
+        rational = level.get("price_r")
+        result.append(
+            OrderBookLevel(
+                price=str(price),
+                amount=str(amount),
+                price_numerator=str(rational["n"]) if isinstance(rational, Mapping) else None,
+                price_denominator=str(rational["d"]) if isinstance(rational, Mapping) else None,
+            )
+        )
+    return tuple(result)
 
 
 def _decimal(value: object) -> Decimal:

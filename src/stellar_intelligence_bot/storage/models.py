@@ -172,3 +172,61 @@ class MarketSnapshotRecord(Base):
     ask_depth: Mapped[Decimal] = mapped_column(Numeric(38, 18), nullable=False)
     spread_percent: Mapped[Decimal | None] = mapped_column(Numeric(18, 8))
     observed_facts: Mapped[JsonDocument] = mapped_column(json_type, nullable=False)
+
+
+class EpisodeReviewRecord(Base):
+    """Operator review state for a grouped market episode. Never alters signal records."""
+
+    __tablename__ = "episode_reviews"
+
+    episode_key: Mapped[str] = mapped_column(String(255), primary_key=True)
+    status: Mapped[str] = mapped_column(String(16), nullable=False)
+    reviewed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    signal_count: Mapped[int] = mapped_column(Integer, nullable=False)
+    max_severity: Mapped[str] = mapped_column(String(16), nullable=False)
+    last_signal_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class AssistantSettingsRecord(Base):
+    __tablename__ = "assistant_settings"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    settings: Mapped[JsonDocument] = mapped_column(json_type, nullable=False)
+
+
+class AssistantHeartbeatRecord(Base):
+    __tablename__ = "assistant_heartbeat"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    last_success_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+
+
+class OpportunityRecord(Base):
+    __tablename__ = "assistant_opportunities"
+
+    signal_id: Mapped[str] = mapped_column(String(255), primary_key=True)
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), nullable=False, index=True
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    pair_key: Mapped[str] = mapped_column(String(255), nullable=False)
+    side: Mapped[str] = mapped_column(String(8), nullable=False)
+    parameters: Mapped[JsonDocument] = mapped_column(json_type, nullable=False)
+
+
+class OpportunityEvaluationRecord(Base):
+    __tablename__ = "assistant_opportunity_evaluations"
+    __table_args__ = (
+        UniqueConstraint("signal_id", "horizon_minutes", name="uq_opportunity_horizon"),
+        Index("ix_opportunity_evaluation_due", "status", "target_at"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    signal_id: Mapped[str] = mapped_column(
+        ForeignKey("assistant_opportunities.signal_id"), nullable=False
+    )
+    horizon_minutes: Mapped[int] = mapped_column(Integer, nullable=False)
+    target_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    status: Mapped[str] = mapped_column(String(32), nullable=False)
+    result: Mapped[JsonDocument | None] = mapped_column(json_type)

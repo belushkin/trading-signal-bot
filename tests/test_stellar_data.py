@@ -3,6 +3,7 @@ from decimal import Decimal
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from sqlalchemy import select
 
 from stellar_intelligence_bot.chains.stellar.collector import (
     StellarCollector,
@@ -11,6 +12,9 @@ from stellar_intelligence_bot.chains.stellar.collector import (
     parse_trade,
 )
 from stellar_intelligence_bot.core.markets import MarketPair
+from stellar_intelligence_bot.storage.database import Database
+from stellar_intelligence_bot.storage.models import EventRecord, MarketSnapshotRecord
+from stellar_intelligence_bot.workers.processor import EventProcessor
 
 
 def test_parse_payment_operation_keeps_transfer_facts_neutral() -> None:
@@ -127,6 +131,83 @@ async def test_order_book_bid_depth_converts_quote_to_base() -> None:
     assert item.event.attributes["bid_depth_units"] == "base"
     assert "selling_asset_type=native" in item.event.source_ref
     assert "buying_asset_code=USDC" in item.event.source_ref
+
+
+@pytest.mark.asyncio
+async def test_order_book_levels_are_persisted_without_changing_snapshot_facts(tmp_path) -> None:
+    pair = MarketPair.parse("native/USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+    client = MagicMock()
+    client.base_url = "https://horizon.stellar.org"
+    client.order_book = AsyncMock(return_value={
+        "bids": [{"price": "0.3333333", "amount": "10", "price_r": {"n": 1, "d": 3}}],
+        "asks": [{"price": "0.6", "amount": "8", "price_r": {"n": 3, "d": 5}}],
+    })
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'levels.db'}")
+    await db.initialize()
+    try:
+        item = await StellarCollector(client, (pair,), db)._market_snapshot(pair)
+        processor = EventProcessor(
+            db, whale_thresholds={}, baseline_samples=20, anomaly_multiplier=Decimal(3),
+            large_order_threshold=Decimal(10000), spread_threshold_percent=Decimal(1),
+            price_windows_minutes=(5,),
+        )
+        await processor.process(item)
+        await processor.process(item)
+        async with db.sessions() as session:
+            snapshot = (await session.scalars(select(MarketSnapshotRecord))).one()
+            source = (await session.scalars(select(EventRecord))).one()
+        levels = snapshot.observed_facts["order_book_levels"]
+        assert levels == {
+            "version": 1,
+            "price_units": "quote_per_base",
+            "bid_amount_units": "quote",
+            "ask_amount_units": "base",
+            "requested_limit": 20,
+            "bids": [{
+                "price": str(Decimal(1) / Decimal(3)), "amount": "10",
+                "price_numerator": "1", "price_denominator": "3",
+            }],
+            "asks": [{
+                "price": "0.6", "amount": "8",
+                "price_numerator": "3", "price_denominator": "5",
+            }],
+        }
+        assert snapshot.bid_depth == Decimal(10) / (Decimal(1) / Decimal(3))
+        assert snapshot.ask_depth == Decimal(8)
+        assert "order_book_levels" not in source.attributes
+        assert source.source_ref == item.event.source_ref
+    finally:
+        await db.close()
+
+
+@pytest.mark.asyncio
+async def test_invalid_order_book_levels_remain_retryable() -> None:
+    pair = MarketPair.parse("native/USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+    client = MagicMock()
+    client.base_url = "https://horizon.stellar.org"
+    client.order_book = AsyncMock(return_value={
+        "bids": [{"price_r": {"n": 1, "d": 0}, "amount": "10"}], "asks": [],
+    })
+    with pytest.raises(ValueError, match="denominator"):
+        await StellarCollector(client, (pair,), MagicMock())._market_snapshot(pair)
+
+
+@pytest.mark.asyncio
+async def test_order_book_levels_preserve_missing_rational_price_and_empty_side() -> None:
+    pair = MarketPair.parse("native/USDC:GAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAWHF")
+    client = MagicMock()
+    client.base_url = "https://horizon.stellar.org"
+    client.order_book = AsyncMock(return_value={
+        "bids": [], "asks": [{"price": "0.5", "amount": "2"}],
+    })
+    item = await StellarCollector(client, (pair,), MagicMock())._market_snapshot(pair)
+    assert item.order_book_levels is not None
+    assert item.order_book_levels.bids == ()
+    assert len(item.order_book_levels.asks) == 1
+    level = item.order_book_levels.asks[0]
+    assert (level.price, level.amount) == ("0.5", "2")
+    assert level.price_numerator is None
+    assert level.price_denominator is None
 
 
 @pytest.mark.asyncio

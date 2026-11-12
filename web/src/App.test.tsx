@@ -1,6 +1,14 @@
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import App from "./App";
+
+vi.mock("./Opportunities", () => ({
+  Opportunities: () => <div>No actionable opportunity currently meets the required criteria.</div>,
+}));
+
+async function openDiagnostics() {
+  fireEvent.click(await screen.findByText("Technical diagnostics"));
+}
 
 describe("dashboard request states", () => {
   afterEach(() => {
@@ -61,9 +69,13 @@ describe("dashboard request states", () => {
       })),
     );
     render(<App />);
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
+    expect(screen.queryByText("No markets configured")).not.toBeInTheDocument();
+    await openDiagnostics();
     expect(await screen.findByText("No markets configured")).toBeInTheDocument();
-    expect(screen.getByText("No notable events yet")).toBeInTheDocument();
+    expect(screen.getByText("No action needed")).toBeInTheDocument();
     expect(screen.getByText("No persisted Stellar events yet.")).toBeInTheDocument();
+    expect(screen.queryByText(/hypothetical trade calculator/i)).not.toBeInTheDocument();
   });
 
   it("loads a different response shape after navigating between dashboard pages", async () => {
@@ -93,9 +105,47 @@ describe("dashboard request states", () => {
       }),
     );
     render(<App />);
-    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Activity" }));
     expect(await screen.findByText("No recent activity")).toBeInTheDocument();
+  });
+
+  it("persists portfolio settings through the API", async () => {
+    const overview = {
+      collector: { status: "healthy", last_success_at: null, last_error_at: null, last_error: null },
+      database: { status: "healthy" }, counts: { events: 0, signals: 0 },
+      last_event_at: null, last_signal_at: null, data_freshness_seconds: null,
+      monitored_pairs: [], markets: [], recent_signals: [], warnings: [],
+    };
+    let settings: unknown = null;
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      if (String(input).includes("/api/assistant/settings")) {
+        if (init?.method === "PUT") settings = JSON.parse(String(init.body));
+        return { ok: true, json: async () => ({ settings }) };
+      }
+      return { ok: true, json: async () => String(input).includes("/api/health") ? { refresh_seconds: 20 } : overview };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const app = render(<App />);
+    await screen.findByText("No actionable opportunity currently meets the required criteria.");
+    fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
+    const balance = await screen.findByLabelText("Balance: XLM");
+    await vi.waitFor(() => expect(balance).toBeEnabled());
+    fireEvent.change(balance, { target: { value: "100" } });
+    fireEvent.change(screen.getByLabelText("XLM reserve"), { target: { value: "10" } });
+    fireEvent.change(screen.getByLabelText("Assumed fee per transaction (XLM)"), { target: { value: "0.001" } });
+    fireEvent.change(screen.getByLabelText("Maximum allocation (%)"), { target: { value: "5" } });
+    fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
+    expect(await screen.findByText("Settings saved. New signals will use these settings.")).toBeVisible();
+    fireEvent.click(screen.getByRole("button", { name: "Overview" }));
+    fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
+    expect(await screen.findByLabelText("Balance: XLM")).toHaveValue("100");
+    expect(fetchMock.mock.calls.some((call) => call[1]?.method === "PUT")).toBe(true);
+    app.unmount();
+    render(<App />);
+    await screen.findByText("No actionable opportunity currently meets the required criteria.");
+    fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
+    await vi.waitFor(() => expect(screen.getByLabelText("Balance: XLM")).toHaveValue("100"));
   });
 
   it("shows watchlist tier, disabled state, and missing market metrics", async () => {
@@ -139,7 +189,7 @@ describe("dashboard request states", () => {
       };
     }));
     render(<App />);
-    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Markets" }));
     expect(await screen.findByText(/Tier 2/)).toBeInTheDocument();
     expect(screen.getAllByText("Disabled").length).toBeGreaterThan(0);
@@ -171,7 +221,7 @@ describe("dashboard request states", () => {
         : String(input).includes("/api/analytics") ? analytics : overview,
     })));
     render(<App />);
-    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
     expect(await screen.findByText(/5 legacy signals excluded/)).toBeInTheDocument();
     expect(screen.getByText("Insufficient sample")).toBeInTheDocument();
@@ -206,6 +256,7 @@ describe("dashboard request states", () => {
         : String(input).includes("/api/analytics") ? analytics : overview,
     })));
     render(<App />);
+    await openDiagnostics();
     expect(await screen.findByText(/3 skipped trades/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
     expect(await screen.findByText("Order-book mid")).toBeInTheDocument();
@@ -228,12 +279,90 @@ describe("dashboard request states", () => {
           : overview,
     })));
     render(<App />);
-    expect(await screen.findByText("No notable events yet")).toBeInTheDocument();
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Signals" }));
     await screen.findByText("No signals match these filters");
     const filter = screen.getByLabelText("Signal category");
     for (const value of ["price_movement", "volume_anomaly", "spread_anomaly", "large_trade"]) {
       expect(filter.querySelector(`option[value="${value}"]`)).not.toBeNull();
     }
+  });
+
+  it("groups signals into one episode and lets the operator mark it reviewed", async () => {
+    const at = (m: number) => new Date(Date.now() - m * 60000).toISOString();
+    const signal = (id: string, m: number) => ({
+      signal_id: id, occurred_at: at(m), category: "volume_anomaly", severity: "HIGH", confidence: "medium",
+      pair: "native/VELO:GISSUER", asset: null, interpretation: "x",
+      observed_facts: { observed_base_volume: 2100, baseline_mean_base_volume: 100 }, evaluations: [],
+    });
+    const signals = [signal("s1", 20), signal("s2", 10), signal("s3", 2)];
+    const overview = {
+      collector: { status: "healthy", last_success_at: at(1), last_error_at: null, last_error: null },
+      database: { status: "healthy" }, counts: { events: 1, signals: 3 },
+      last_event_at: at(1), last_signal_at: at(2), data_freshness_seconds: 5,
+      monitored_pairs: ["native/VELO:GISSUER"], markets: [], recent_signals: signals, warnings: [],
+      generated_at: at(0),
+    };
+    const calls: { url: string; method?: string }[] = [];
+    vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      calls.push({ url, method: init?.method });
+      const json = url.includes("/api/health") ? { refresh_seconds: 20 }
+        : url.includes("/api/episode-reviews") ? { items: [] }
+        : url.includes("/api/signals") ? { items: signals, total: 3, limit: 100, offset: 0 }
+        : overview;
+      return { ok: true, json: async () => json };
+    }));
+    render(<App />);
+    expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
+    expect(screen.queryByText("3 related signals", { exact: false })).not.toBeInTheDocument();
+    expect(screen.queryByText("Generated signals")).not.toBeInTheDocument();
+    await openDiagnostics();
+    expect((await screen.findAllByText("3 related signals", { exact: false })).length).toBeGreaterThan(0);
+    expect(screen.getAllByRole("article")).toHaveLength(1);
+    expect(screen.getAllByText(/not trading advice/i).length).toBeGreaterThan(0);
+    fireEvent.click(screen.getByRole("button", { name: "Mark as reviewed" }));
+    await vi.waitFor(() => expect(calls.some((c) => c.method === "PUT" && c.url.endsWith("/api/episode-reviews/s1"))).toBe(true));
+  });
+
+  it("retains market details without the removed calculator", async () => {
+    const pair = "native/VELO:GISSUER";
+    const market = {
+      pair, enabled: true, status: "fresh", latest_price: "2", price_change_24h_percent: null,
+      volume_24h_base: null, last_trade_price: null, last_trade_at: null, best_bid: "1.9",
+      best_ask: "2.1", spread_percent: "9", bid_depth: "10", ask_depth: "20",
+      last_observed_at: new Date().toISOString(),
+    };
+    const overview = {
+      collector: { status: "healthy", last_success_at: new Date().toISOString(), last_error_at: null, last_error: null },
+      database: { status: "healthy" }, counts: { events: 0, signals: 0 },
+      last_event_at: null, last_signal_at: null, data_freshness_seconds: 0,
+      monitored_pairs: [pair], markets: [market], recent_signals: [], warnings: [],
+    };
+    const fetchMock = vi.fn(async (input: RequestInfo | URL) => {
+      const path = String(input);
+      const body = path.includes("/api/health") ? { refresh_seconds: 20 }
+        : path.includes("/api/episode-reviews") ? { items: [] }
+        : path.includes("/api/signals") ? { items: [], total: 0 }
+        : path.includes("/api/markets/") ? {
+          pair, summary: market, history: [], volume_history: [], recent_trades: [],
+          latest_order_book_levels: { observed_at: "2026-01-01T00:00:00Z", levels: { bids: [], bid_amount_units: "quote" } },
+          data_source: "Persisted data", truncated: false,
+        } : overview;
+      return { ok: true, json: async () => body };
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    render(<App />);
+    await openDiagnostics();
+    fireEvent.click(await screen.findByRole("row", { name: /native\/VELO.*fresh/i }));
+    const dialog = await screen.findByRole("dialog", { name: "Market detail" });
+    expect(await within(dialog).findByText(/Persisted data/)).toBeVisible();
+    fireEvent.click(within(dialog).getByText("Latest recorded order-book levels"));
+    expect(within(dialog).getByText(/not proof of executable liquidity/)).toBeVisible();
+    expect(within(dialog).getByText(/"bid_amount_units": "quote"/)).toBeVisible();
+    expect(within(dialog).queryByText(/calculator/i)).not.toBeInTheDocument();
+    expect(fetchMock).toHaveBeenCalledWith(
+      `/api/markets/${encodeURIComponent(pair)}?history_hours=24`, expect.objectContaining({ signal: expect.any(AbortSignal) }),
+    );
   });
 });

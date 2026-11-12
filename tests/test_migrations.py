@@ -14,7 +14,7 @@ def test_initial_migration_creates_persistent_schema(tmp_path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
 
-    assert version == ("0005_trade_provenance",)
+    assert version == ("0007_actionable_signals",)
     assert {
         "events",
         "signals",
@@ -24,6 +24,11 @@ def test_initial_migration_creates_persistent_schema(tmp_path) -> None:
         "market_snapshots",
         "signal_evaluations",
         "runtime_health",
+        "episode_reviews",
+        "assistant_settings",
+        "assistant_heartbeat",
+        "assistant_opportunities",
+        "assistant_opportunity_evaluations",
     } <= tables
     with sqlite3.connect(database_path) as connection:
         event_indexes = {row[1] for row in connection.execute("PRAGMA index_list('events')")}

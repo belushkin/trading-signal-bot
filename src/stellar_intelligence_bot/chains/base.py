@@ -27,6 +27,20 @@ class TradeProvenance:
 
 
 @dataclass(frozen=True, slots=True)
+class OrderBookLevel:
+    price: str
+    amount: str
+    price_numerator: str | None
+    price_denominator: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class OrderBookLevels:
+    bids: tuple[OrderBookLevel, ...]
+    asks: tuple[OrderBookLevel, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class CollectedEvent:
     event: ChainEvent | None
     stream_key: str | None = None
@@ -37,6 +51,7 @@ class CollectedEvent:
     is_market_snapshot: bool = False
     provenance: TradeProvenance | None = None
     skipped_reason: str | None = None
+    order_book_levels: OrderBookLevels | None = None
 
 
 class ChainCollector(Protocol):
