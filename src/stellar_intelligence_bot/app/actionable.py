@@ -6,6 +6,7 @@ from typing import Literal
 
 from pydantic import BaseModel, Field, model_validator
 from sqlalchemy import select
+from sqlalchemy.ext.asyncio import AsyncSession
 
 from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.storage.database import Database
@@ -21,18 +22,16 @@ from stellar_intelligence_bot.storage.models import (
 HORIZONS = (5, 10, 60, 240, 1440, 10080)
 STEP = Decimal("0.0000001")
 MAX_AMOUNT = Decimal("922337203685.4775807")
+DEFAULT_FEE = Decimal("0.00001")
 
 
-class AssistantSettings(BaseModel):
+class PortfolioSettings(BaseModel):
     balances: dict[str, Decimal]
     reserve: Decimal = Field(ge=0, le=MAX_AMOUNT, decimal_places=7)
-    fee: Decimal = Field(ge=0, le=MAX_AMOUNT, decimal_places=7)
     allocation: Decimal = Field(gt=0, le=100, decimal_places=4)
-    min_movement_percent: Decimal = Field(gt=0, le=100, decimal_places=4)
-    minimum_severity: Literal["WATCH", "HIGH"] = "WATCH"
 
     @model_validator(mode="after")
-    def validate_balances(self) -> "AssistantSettings":
+    def validate_balances(self) -> "PortfolioSettings":
         from stellar_intelligence_bot.core.markets import StellarAsset
 
         for key, amount in self.balances.items():
@@ -45,9 +44,15 @@ class AssistantSettings(BaseModel):
                 raise ValueError("Asset balances permit at most seven decimal places")
         if "native" not in self.balances:
             raise ValueError("An XLM balance is required")
-        if self.balances["native"] < self.reserve + 2 * self.fee:
-            raise ValueError("XLM balance must cover the reserve and two assumed fees")
+        if self.balances["native"] < self.reserve:
+            raise ValueError("XLM balance must cover the reserve")
         return self
+
+
+class AssistantSettings(PortfolioSettings):
+    fee: Decimal = Field(default=DEFAULT_FEE, ge=0, le=MAX_AMOUNT, decimal_places=7)
+    min_movement_percent: Decimal = Field(default=Decimal("1"), gt=0, le=100, decimal_places=4)
+    minimum_severity: Literal["WATCH", "HIGH"] = "WATCH"
 
 
 def _utc(value: datetime) -> datetime:
@@ -62,11 +67,63 @@ def _d(value: object) -> Decimal | None:
         return None
 
 
+async def portfolio_value(
+    session: AsyncSession,
+    balances: dict[str, Decimal],
+    reserve: Decimal,
+    pairs: tuple[MarketPair, ...],
+    at: datetime,
+) -> tuple[Decimal | None, list[str], dict[str, object]]:
+    """Value nonzero holdings in XLM using fresh, direct liquidation-side quotes."""
+    total = balances["native"] - reserve
+    missing: list[str] = []
+    sources: dict[str, object] = {}
+    for asset, balance in balances.items():
+        if asset == "native" or balance == 0:
+            continue
+        candidates = [
+            pair for pair in pairs
+            if (pair.base.key == "native" and pair.quote.key == asset)
+            or (pair.quote.key == "native" and pair.base.key == asset)
+        ]
+        best: MarketSnapshotRecord | None = None
+        chosen: MarketPair | None = None
+        for pair in candidates:
+            book = await session.scalar(
+                select(MarketSnapshotRecord)
+                .where(
+                    MarketSnapshotRecord.pair_key == pair.key,
+                    MarketSnapshotRecord.observed_at <= at,
+                    MarketSnapshotRecord.observed_at >= at - timedelta(minutes=2),
+                    MarketSnapshotRecord.best_bid > 0,
+                    MarketSnapshotRecord.best_ask >= MarketSnapshotRecord.best_bid,
+                )
+                .order_by(MarketSnapshotRecord.observed_at.desc(), MarketSnapshotRecord.id.desc())
+                .limit(1)
+            )
+            if book is not None and (
+                best is None or _utc(book.observed_at) > _utc(best.observed_at)
+            ):
+                best, chosen = book, pair
+        if best is None or chosen is None or best.best_bid is None or best.best_ask is None:
+            missing.append(asset)
+            continue
+        rate = Decimal(1) / best.best_ask if chosen.base.key == "native" else best.best_bid
+        total += balance * rate
+        sources[asset] = {
+            "pair": chosen.key, "snapshot_id": best.id,
+            "observed_at": _utc(best.observed_at).isoformat(), "xlm_per_asset": str(rate),
+        }
+    return (None if missing else total), missing, sources
+
+
 def build_idea(
     signal: SignalRecord,
     snapshot: MarketSnapshotRecord,
     pair: MarketPair,
     config: AssistantSettings,
+    value_xlm: Decimal,
+    valuation_sources: dict[str, object],
 ) -> tuple[str, dict[str, object]] | None:
     """Construct only from signal-time book; zero direction and unknown input reject."""
     move = _d(signal.observed_facts.get("observed_percent"))
@@ -115,12 +172,15 @@ def build_idea(
         ):
             liquidity += amount if side == "BUY" else amount / price
     xlm = config.balances.get("native", Decimal(0))
+    if xlm < config.reserve + 2 * config.fee:
+        return None
     available = (
         config.balances.get(pair.quote.key, Decimal(0))
         if side == "BUY"
         else xlm - config.reserve - 2 * config.fee
     )
-    budget = available * config.allocation / 100
+    limit_xlm = value_xlm * config.allocation / 100
+    budget = min(available, limit_xlm * bid if side == "BUY" else limit_xlm)
     quantity = (budget / price if side == "BUY" else budget).quantize(STEP, rounding=ROUND_DOWN)
     if quantity <= 0 or quantity > liquidity:
         return None
@@ -167,13 +227,15 @@ def build_idea(
             / quote
             * 100
         ),
-        "allocation_percent_of_available_asset": str(config.allocation),
+        "allocation_percent_of_portfolio": str(config.allocation),
+        "portfolio_value_xlm": str(value_xlm),
+        "valuation_sources": valuation_sources,
         "reserve_xlm": str(config.reserve),
         "base_balance": str(xlm),
         "quote_balance": str(config.balances.get(pair.quote.key, 0)),
         "limitations": [
             "Preliminary momentum rule is unvalidated and may fail.",
-            "Transaction fees are user assumptions converted at the observed bid.",
+            "Transaction fees are estimates converted at the observed bid.",
             "Spread is reflected by using ask for a buy and bid for a sell; "
             "exit target uses the opposite side.",
             "Slippage, future spread, actual network fees and execution are unknown; "
@@ -219,7 +281,12 @@ async def process_ideas(db: Database, pairs: tuple[MarketPair, ...], now: dateti
                 )
                 if snapshot is None:
                     continue
-                idea = build_idea(signal, snapshot, pair, settings)
+                value, _, sources = await portfolio_value(
+                    session, settings.balances, settings.reserve, pairs, _utc(signal.occurred_at)
+                )
+                if value is None:
+                    continue
+                idea = build_idea(signal, snapshot, pair, settings, value, sources)
                 if idea is None:
                     continue
                 side, parameters = idea
@@ -303,6 +370,8 @@ async def process_ideas(db: Database, pairs: tuple[MarketPair, ...], now: dateti
                 _utc(evaluation.target_at) - last_at <= timedelta(minutes=2)
             )
             evaluation.status = "observed" if near_horizon else "unknown"
+            evaluation.entry_price_observed = entry_seen
+            evaluation.target_price_observed = target_seen
             evaluation.result = {
                 "entry_price_observed": entry_seen,
                 "target_price_observed_after_entry": target_seen,

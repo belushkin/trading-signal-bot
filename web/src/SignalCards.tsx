@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { Signal, SignalEvaluation, VolumeEvidence } from "./api";
-import { categoryTitle, explainSignal, pairNames, severityInfo } from "./explain";
+import { categoryTitle, explainSignal, fmt, horizonLabel, pairNames, priceDirectionSentence, severityInfo } from "./explain";
 import type { Explanation } from "./explain";
 
 export function SeverityTag({ value }: { value: string }) {
@@ -29,17 +29,17 @@ export function ExplanationBody({ explanation }: { explanation: Explanation }) {
   const measured = explanation.afterwards.some((item) => item.measured);
   return (
     <div className="story">
-      <Section question="Why should I care?"><p>{explanation.why}</p></Section>
-      <Section question="What did we observe?"><ul>{explanation.observed.map((line) => <li key={line}>{line}</li>)}</ul></Section>
-      <Section question="What happened afterwards?">
+      <Section question="Why does it matter?"><p>{explanation.why}</p></Section>
+      <Section question="What happened?"><ul>{explanation.observed.map((line) => <li key={line}>{line}</li>)}</ul></Section>
+      <Section question="What happened later?">
         <ul className="afterwards">
           {explanation.afterwards.map((item) => <li key={item.horizon} className={item.measured ? "" : "muted"}><strong>{item.horizon}</strong> {item.text}</li>)}
         </ul>
         {explanation.afterwardsNote && <p className="story-note">{explanation.afterwardsNote}</p>}
-        <p className="story-note">{measured ? "These are observed price changes only. They are not profit or trading performance, and they do not show that the event caused them." : "No later price has been measured yet. An unmeasured price is not the same as no price change."}</p>
+        <p className="story-note">{measured ? "These are price changes, not profit. We do not know if the event caused them." : "We do not have a later price yet. This does not mean the price stayed the same."}</p>
       </Section>
-      <Section question="How reliable is this assessment?"><ul>{explanation.reliability.map((line) => <li key={line}>{line}</li>)}</ul></Section>
-      <Section question="What don't we know?"><ul>{explanation.unknowns.map((line) => <li key={line}>{line}</li>)}</ul></Section>
+      <Section question="How much data do we have?"><ul>{explanation.reliability.map((line) => <li key={line}>{line}</li>)}</ul></Section>
+      <Section question="What is unknown?"><ul>{explanation.unknowns.map((line) => <li key={line}>{line}</li>)}</ul></Section>
     </div>
   );
 }
@@ -47,6 +47,15 @@ export function ExplanationBody({ explanation }: { explanation: Explanation }) {
 export function SignalCard({ signal, onOpen }: { signal: Explainable; onOpen: (id: string) => void }) {
   const explanation = explainSignal(signal);
   const pair = pairNames(signal.pair);
+  const observation = explanation.observed[0];
+  const missingOutcome = signal.evaluations?.some((item) => item.status !== "pending" && item.status !== "measured");
+  const totals = signal.trade_totals;
+  const singleTrade = signal.category === "large_trade"
+    && signal.observed_facts?.base_amount_xlm != null
+    && signal.observed_facts?.observed_quote_notional != null;
+  const measured = [...(signal.evaluations ?? [])]
+    .filter((item) => item.status === "measured")
+    .sort((a, b) => a.horizon_minutes - b.horizon_minutes);
   return (
     <article className={`panel signal-card sev-${signal.severity.toLowerCase()}`}>
       <header>
@@ -55,9 +64,19 @@ export function SignalCard({ signal, onOpen }: { signal: Explainable; onOpen: (i
         <span className="signal-market">{pair.label}</span>
         <time className="muted" dateTime={signal.occurred_at}>{ago(signal.occurred_at)}</time>
       </header>
-      <h3>What happened? {explanation.title}</h3>
-      <ExplanationBody explanation={explanation} />
-      <button className="button button-secondary" onClick={() => onOpen(signal.signal_id)}>See evidence and technical details</button>
+      <h3>{explanation.title}</h3>
+      {totals ? <p className="signal-summary">{totals.trade_count} {totals.trade_count === 1 ? "trade exchanged" : "trades exchanged"} about {fmt(totals.base_amount)} {pair.base} for {fmt(totals.quote_amount)} {pair.counter}.</p>
+        : singleTrade ? <p className="signal-summary">1 trade exchanged about {fmt(signal.observed_facts?.base_amount_xlm)} {pair.base} for {fmt(signal.observed_facts?.observed_quote_notional)} {pair.counter}.</p>
+        : observation && !observation.includes("N/A") && <p className="signal-summary">{observation}</p>}
+      {signal.category === "volume_anomaly" && !totals && <p className="signal-summary">Trade count and total received are unavailable.</p>}
+      {measured.length ? measured.map((item) => (
+        <p className="signal-outcome" key={item.horizon_minutes}>
+          After {horizonLabel(item.horizon_minutes)}: {priceDirectionSentence(pair, item.observed_change_percent)}
+        </p>
+      )) : <p className="signal-outcome">{missingOutcome ? "We do not have enough data to check the later price." : "We have not checked the later price yet."}</p>}
+      {measured.length > 0 && missingOutcome && <p className="signal-outcome">Some later price checks do not have enough data.</p>}
+      {explanation.afterwardsNote && <p className="signal-outcome">{explanation.afterwardsNote}</p>}
+      <button className="button button-secondary" onClick={() => onOpen(signal.signal_id)}>View details</button>
     </article>
   );
 }

@@ -8,7 +8,8 @@ def test_settings_use_default_log_level(monkeypatch: pytest.MonkeyPatch) -> None
 
     settings = Settings.from_env()
     assert settings.log_level == "INFO"
-    assert [entry.pair.quote.code for entry in settings.watchlist if entry.enabled] == [
+    assert [entry.pair.quote.code for entry in settings.watchlist if entry.enabled
+            and entry.pair.base.key == "native"] == [
         "USDC",
         "SHX",
         "VELO",
@@ -87,6 +88,25 @@ def test_watchlist_can_enable_tier_two_or_disable_all(monkeypatch: pytest.Monkey
     assert not Settings.from_env().monitored_pairs
 
 
+def test_usdc_cross_markets_follow_enabled_asset_selection(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("BOT_MONITORED_PAIRS", raising=False)
+    monkeypatch.setenv("BOT_WATCHLIST_ENABLED", "USDC,VELO,SHX,AQUA")
+    settings = Settings.from_env()
+    assets = {entry.pair.quote.code: entry.pair.quote for entry in settings.watchlist
+              if entry.pair.base.key == "native"}
+    cross = [pair for pair in settings.monitored_pairs if pair.base == assets["USDC"]]
+    assert [pair.quote for pair in cross] == [assets["VELO"], assets["SHX"], assets["AQUA"]]
+    assert len(settings.monitored_pairs) == 7
+
+    monkeypatch.setenv("BOT_WATCHLIST_ENABLED", "USDC,VELO")
+    settings = Settings.from_env()
+    cross = [pair for pair in settings.monitored_pairs if pair.base == assets["USDC"]]
+    assert [pair.quote for pair in cross] == [assets["VELO"]]
+
+    monkeypatch.setenv("BOT_WATCHLIST_ENABLED", "VELO,SHX,AQUA")
+    assert all(pair.base.key == "native" for pair in Settings.from_env().monitored_pairs)
+
+
 def test_watchlist_rejects_unknown_assets(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("BOT_WATCHLIST_ENABLED", "USDC,UNKNOWN")
     with pytest.raises(ValueError, match="Unknown BOT_WATCHLIST_ENABLED"):
@@ -96,7 +116,7 @@ def test_watchlist_rejects_unknown_assets(monkeypatch: pytest.MonkeyPatch) -> No
 def test_watchlist_exact_identities_and_legacy_override(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.delenv("BOT_MONITORED_PAIRS", raising=False)
     settings = Settings.from_env()
-    assert [entry.pair.key for entry in settings.watchlist] == [
+    assert [entry.pair.key for entry in settings.watchlist[:6]] == [
         "native/USDC:GA5ZSEJYB37JRC5AVCIA5MOP4RHTM335X2KGX3IHOJAPP5RE34K4KZVN",
         "native/SHX:GDSTRSHXHGJ7ZIVRBXEYE5Q74XUVCUSEKEBR7UCHEUUEK72N7I7KJ6JH",
         "native/VELO:GDM4RQUQQUVSKQA7S6EM7XBZP3FCGH4Q7CL6TABQ7B2BEJ5ERARM2M5M",

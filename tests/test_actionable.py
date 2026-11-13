@@ -4,7 +4,12 @@ from decimal import Decimal
 import pytest
 from sqlalchemy import select
 
-from stellar_intelligence_bot.app.actionable import AssistantSettings, build_idea, process_ideas
+from stellar_intelligence_bot.app.actionable import (
+    AssistantSettings,
+    build_idea,
+    portfolio_value,
+    process_ideas,
+)
 from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.storage.database import Database
 from stellar_intelligence_bot.storage.models import (
@@ -53,7 +58,7 @@ def snapshot(at: datetime, bid: str = "1", ask: str = "1.25") -> MarketSnapshotR
 @pytest.mark.parametrize(("movement", "side"), [("2", "BUY"), ("-2", "SELL")])
 def test_sizing_target_and_costs_are_directional(movement: str, side: str) -> None:
     now = datetime.now(UTC)
-    idea = build_idea(signal(now, movement), snapshot(now), PAIR, settings())
+    idea = build_idea(signal(now, movement), snapshot(now), PAIR, settings(), Decimal("170"), {})
     assert idea is not None
     actual_side, result = idea
     assert actual_side == side
@@ -65,17 +70,70 @@ def test_sizing_target_and_costs_are_directional(movement: str, side: str) -> No
     assert profit >= quantity * entry * Decimal("0.01")
     assert profit == Decimal(str(result["estimated_profit_quote"]))
     assert quantity.as_tuple().exponent >= -7
+    assert quantity * (entry / Decimal("1") if side == "BUY" else 1) <= Decimal("17")
 
 
 def test_incomplete_liquidity_and_units_reject() -> None:
     now = datetime.now(UTC)
     book = snapshot(now)
     book.observed_facts["order_book_levels"]["price_units"] = "unknown"
-    assert build_idea(signal(now), book, PAIR, settings()) is None
+    assert build_idea(signal(now), book, PAIR, settings(), Decimal("100"), {}) is None
     book = snapshot(now)
     book.observed_facts["order_book_levels"]["asks"][0]["amount"] = "0.001"
-    assert build_idea(signal(now), book, PAIR, settings()) is None
-    assert build_idea(signal(now, "0.5"), snapshot(now), PAIR, settings()) is None
+    assert build_idea(signal(now), book, PAIR, settings(), Decimal("100"), {}) is None
+    assert build_idea(
+        signal(now, "0.5"), snapshot(now), PAIR, settings(), Decimal("100"), {}
+    ) is None
+
+
+@pytest.mark.parametrize(("movement", "expected"), [("2", Decimal("8")), ("-2", Decimal("10"))])
+def test_position_cap_uses_portfolio_value_not_asset_balance(
+    movement: str, expected: Decimal
+) -> None:
+    now = datetime.now(UTC)
+    idea = build_idea(signal(now, movement), snapshot(now), PAIR, settings(), Decimal("100"), {})
+    assert idea is not None
+    assert Decimal(str(idea[1]["quantity"])) == expected
+
+
+def test_position_cap_respects_spendable_balance() -> None:
+    now = datetime.now(UTC)
+    config = settings()
+    config.balances[PAIR.quote.key] = Decimal("1.25")
+    idea = build_idea(signal(now), snapshot(now), PAIR, config, Decimal("1000"), {})
+    assert idea is not None and Decimal(str(idea[1]["quantity"])) == Decimal("1")
+
+
+@pytest.mark.asyncio
+async def test_portfolio_valuation_reserve_staleness_and_no_future_data(tmp_path) -> None:
+    db = Database(f"sqlite+aiosqlite:///{tmp_path / 'values.db'}")
+    await db.initialize()
+    now = datetime.now(UTC)
+    try:
+        async with db.sessions.begin() as session:
+            session.add(snapshot(now))
+        async with db.sessions() as session:
+            value, missing, sources = await portfolio_value(
+                session, settings().balances, Decimal("10"), (PAIR,), now
+            )
+            assert value == Decimal("170")
+            assert missing == []
+            assert sources[PAIR.quote.key]["pair"] == PAIR.key
+            value, missing, _ = await portfolio_value(
+                session, settings().balances, Decimal("10"), (PAIR,), now + timedelta(minutes=3)
+            )
+            assert value is None and missing == [PAIR.quote.key]
+            value, missing, _ = await portfolio_value(
+                session, settings().balances, Decimal("10"), (PAIR,), now - timedelta(seconds=1)
+            )
+            assert value is None and missing == [PAIR.quote.key]
+            value, missing, _ = await portfolio_value(
+                session, {"native": Decimal("100"), PAIR.quote.key: Decimal(0)},
+                Decimal("10"), (PAIR,), now + timedelta(days=1),
+            )
+            assert value == Decimal("90") and not missing
+    finally:
+        await db.close()
 
 
 @pytest.mark.asyncio
@@ -111,12 +169,36 @@ async def test_persistence_idempotence_and_sampled_outcomes(tmp_path) -> None:
             evaluations = (await session.scalars(
                 select(OpportunityEvaluationRecord).order_by(OpportunityEvaluationRecord.horizon_minutes)
             )).all()
-            assert len(evaluations) == 6
+            assert [item.horizon_minutes for item in evaluations] == [5, 10, 60, 240, 1440, 10080]
             assert evaluations[0].status == "observed"
             assert evaluations[0].result["entry_price_observed"] is True
             assert evaluations[0].result["target_price_observed_after_entry"] is True
             assert evaluations[0].result["execution"] == "unknown"
+            assert evaluations[0].entry_price_observed is True
+            assert evaluations[0].target_price_observed is True
             assert evaluations[1].status == "unknown"
             assert evaluations[1].result["price_change_percent"] is None
+            assert all(item.status == "pending" and item.result is None for item in evaluations[2:])
+            assert all(item.target_price_observed is None for item in evaluations[2:])
+
+        for minutes in (60, 240, 1440, 10080):
+            at = now + timedelta(minutes=minutes)
+            async with db.sessions.begin() as session:
+                session.add(snapshot(at, str(target + Decimal("0.01")), str(target + Decimal("0.1"))))
+            await process_ideas(db, (PAIR,), at)
+            async with db.sessions() as session:
+                result = await session.scalar(
+                    select(OpportunityEvaluationRecord).where(
+                        OpportunityEvaluationRecord.signal_id == "signal",
+                        OpportunityEvaluationRecord.horizon_minutes == minutes,
+                    )
+                )
+                assert result is not None
+                assert result.status == "observed"
+                assert result.entry_price_observed is True
+                assert result.target_price_observed is True
+                assert result.result is not None
+                assert result.result["price_change_percent"] is not None
+                assert result.result["target_price_observed_after_entry"] is True
     finally:
         await db.close()

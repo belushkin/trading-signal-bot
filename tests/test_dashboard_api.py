@@ -12,6 +12,7 @@ from stellar_intelligence_bot.app.dashboard_api import create_app
 from stellar_intelligence_bot.core.markets import MarketPair
 from stellar_intelligence_bot.storage.database import Database
 from stellar_intelligence_bot.storage.models import (
+    AssistantSettingsRecord,
     EventRecord,
     MarketSnapshotRecord,
     RuntimeHealthRecord,
@@ -29,8 +30,7 @@ async def test_assistant_settings_persist_and_screening_health_is_explicit(tmp_p
     config = Settings(monitored_pairs=(MarketPair.parse(PAIR),))
     payload = {
         "balances": {"native": "100", f"USDC:{ISSUER}": "50"},
-        "reserve": "10", "fee": "0.001", "allocation": "5",
-        "min_movement_percent": "1", "minimum_severity": "WATCH",
+        "reserve": "10", "allocation": "5",
     }
     async with _api(str(tmp_path / "assistant.db"), config) as (client, db):
         response = await client.get("/api/assistant/opportunities")
@@ -40,6 +40,28 @@ async def test_assistant_settings_persist_and_screening_health_is_explicit(tmp_p
         assert (await client.get("/api/assistant/settings")).json()["settings"]["balances"] == (
             payload["balances"]
         )
+        valuation = (await client.post("/api/assistant/portfolio-value", json=payload)).json()
+        assert valuation["value_xlm"] is None
+        assert valuation["missing_assets"] == [f"USDC:{ISSUER}"]
+        async with db.sessions.begin() as session:
+            row = await session.get(AssistantSettingsRecord, 1)
+            row.settings = row.settings | {
+                "fee": "0.001", "min_movement_percent": "2", "minimum_severity": "HIGH",
+            }
+            session.add(MarketSnapshotRecord(
+                pair_key=PAIR, observed_at=datetime.now(UTC), best_bid=Decimal("1"),
+                best_ask=Decimal("1.25"), bid_depth=Decimal(100), ask_depth=Decimal(100),
+                observed_facts={},
+            ))
+        valuation = (await client.post("/api/assistant/portfolio-value", json=payload)).json()
+        assert Decimal(valuation["value_xlm"]) == Decimal("130")
+        assert (await client.put("/api/assistant/settings", json=payload)).status_code == 200
+        async with db.sessions() as session:
+            row = await session.get(AssistantSettingsRecord, 1)
+            assert row.settings["fee"] == "0.001"
+            assert row.settings["min_movement_percent"] == "2"
+            assert row.settings["minimum_severity"] == "HIGH"
+        assert "fee" not in (await client.get("/api/assistant/settings")).json()["settings"]
         now = datetime.now(UTC)
         await db.record_health(started_at=now, successful=True, now=now)
         await process_ideas(db, config.monitored_pairs, now)
@@ -47,6 +69,7 @@ async def test_assistant_settings_persist_and_screening_health_is_explicit(tmp_p
         assert response["screening"] == "healthy"
         assert response["configured"] is True
         assert response["items"] == []
+        assert (await client.get("/api/assistant/target-results")).json() == {"items": []}
         bad = payload | {"balances": {"native": "0"}}
         assert (await client.put("/api/assistant/settings", json=bad)).status_code == 422
 
@@ -154,9 +177,11 @@ async def test_watchlist_exposes_tiers_disabled_pairs_and_missing_data(tmp_path)
         markets = (await client.get("/api/markets")).json()["items"]
         details = await client.get(f"/api/markets/{settings.watchlist[4].pair.key}")
 
-    assert len(markets) == 6
-    assert [market["tier"] for market in markets] == [1, 1, 1, 1, 2, 2]
-    assert [market["enabled"] for market in markets] == [True, True, True, True, False, False]
+    assert len(markets) == 9
+    assert [market["tier"] for market in markets] == [1, 1, 1, 1, 1, 1, 1, 2, 2]
+    assert [market["enabled"] for market in markets] == [
+        True, True, True, True, True, True, True, False, False
+    ]
     assert all(market["status"] == "no_data" for market in markets)
     assert all(market["trade_count_24h"] is None for market in markets)
     assert details.status_code == 200
@@ -431,14 +456,30 @@ async def test_volume_signal_exposes_venue_evidence_without_accounts(tmp_path) -
     async with _api(str(tmp_path / "ev.db"), settings) as (client, database):
         signal_id = await _seed_volume_signal(database)
         detail = await client.get(f"/api/signals/{signal_id}")
+        listing = await client.get("/api/signals")
         denied = await client.get(f"/api/signals/{signal_id}/account-diagnostics")
     body = detail.json()
     evidence = body["volume_evidence"]
     assert evidence["matches_signal_volume"] is True
+    totals = listing.json()["items"][0]["trade_totals"]
+    assert totals["trade_count"] == 2
+    assert Decimal(totals["base_amount"]) == 30
+    assert Decimal(totals["quote_amount"]) == 30
     assert Decimal(evidence["venues"]["order_book"]["base_volume"]) == 20
     assert "GACCOUNTSECRET" not in detail.text
     assert body["account_diagnostics_available"] is False
     assert denied.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_volume_summary_does_not_claim_incomplete_trade_totals(tmp_path) -> None:
+    async with _api(str(tmp_path / "incomplete.db"), Settings()) as (client, database):
+        await _seed_volume_signal(database)
+        async with database.sessions.begin() as session:
+            row = await session.get(SignalRecord, "vol-signal")
+            row.observed_facts = row.observed_facts | {"observed_base_volume": "31"}
+        listing = await client.get("/api/signals")
+        assert listing.json()["items"][0]["trade_totals"] is None
 
 
 @pytest.mark.asyncio

@@ -21,8 +21,6 @@ import {
   X,
 } from "lucide-react";
 import {
-  Area,
-  AreaChart,
   Bar,
   BarChart,
   CartesianGrid,
@@ -38,6 +36,7 @@ import { categoryTitle, explainSignal, pairNames, severityInfo } from "./explain
 import { EpisodeCard } from "./EpisodeCards";
 import { PortfolioSettings } from "./Portfolio";
 import { Opportunities } from "./Opportunities";
+import { SignalAnalytics } from "./SignalAnalytics";
 import { buildEpisodes, placeEpisodes } from "./episodes";
 import type { Episode } from "./episodes";
 import { useEpisodeData } from "./useEpisodeData";
@@ -252,7 +251,7 @@ export default function App() {
                   setOffset={setActivityOffset}
                 />
               )}
-              {view === "Analytics" && <AnalyticsPage data={currentData as Analytics} days={days} setDays={setDays} />}
+              {view === "Analytics" && <SignalAnalytics data={currentData as Analytics} days={days} setDays={setDays} />}
             </>
           )}
         </div>
@@ -517,52 +516,6 @@ function ActivityPage(props: {
   );
 }
 
-function AnalyticsPage({ data, days, setDays }: { data: Analytics; days: number; setDays: (value: number) => void }) {
-  return (
-    <>
-      <PageHeading eyebrow="OBSERVATION QUALITY" title="Analytics" detail="Current engine signals only. Historical signals are excluded; observed changes are not profitability or directional accuracy." action={<PeriodSelect days={days} setDays={setDays} />} />
-      <div className="metric-grid analytics-metrics">
-        <MetricCard title="Events in period" value={formatInteger(data.data_coverage.events)} detail="Persisted chain events" icon={<Database size={17} />} />
-        <MetricCard title="Order-book snapshots" value={formatInteger(data.data_coverage.market_snapshots)} detail="Actual recorded observations" icon={<Waves size={17} />} />
-        <MetricCard title="Measured evaluations" value={formatInteger(data.data_coverage.measured_evaluations)} detail={`${formatInteger(data.data_coverage.missing_evaluations)} missing · ${formatInteger(data.data_coverage.pending_evaluations)} pending`} icon={<ActivityIcon size={17} />} />
-        <MetricCard title="Trade provenance" value={`${formatInteger(data.data_coverage.trades_with_provenance ?? 0)} / ${formatInteger(data.data_coverage.trades)}`} detail={`Measured: ${Object.entries(data.data_coverage.measured_by_price_basis ?? {}).map(([k, v]) => `${priceBasisLabel(k)} ${v}`).join(", ") || "none"}`} icon={<ActivityIcon size={17} />} />
-        <MetricCard title="Missing rate" value={data.data_coverage.missing_observation_rate_percent === null ? "N/A" : `${formatNumber(data.data_coverage.missing_observation_rate_percent)}%`} detail="Of persisted signal evaluation horizons" icon={<AlertTriangle size={17} />} />
-      </div>
-      <div className="chart-grid">
-        <ChartCard title="Signals over time" detail={`Daily count · last ${days} days`}>
-          {data.signal_frequency.length ? <ResponsiveContainer width="100%" height={250}><AreaChart data={data.signal_frequency}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="date" tickFormatter={shortDate} /><YAxis allowDecimals={false} width={34} /><Tooltip /><Area type="linear" dataKey="count" stroke="var(--accent)" fill="var(--accent-soft)" strokeWidth={2} /></AreaChart></ResponsiveContainer> : <ChartEmpty />}
-        </ChartCard>
-        <ChartCard title="Signals by category" detail="Persisted signal categories">
-          {data.signals_by_category.length ? <ResponsiveContainer width="100%" height={250}><BarChart data={data.signals_by_category}><CartesianGrid strokeDasharray="3 3" vertical={false} /><XAxis dataKey="category" tickFormatter={categoryLabel} /><YAxis allowDecimals={false} width={34} /><Tooltip /><Bar dataKey="count" fill="var(--accent)" radius={[4, 4, 0, 0]} /></BarChart></ResponsiveContainer> : <ChartEmpty />}
-        </ChartCard>
-      </div>
-      <section className="section-block">
-        <SectionHeading title="Observed price changes after signals" detail="Descriptive change by horizon; sampled observations only." />
-        <div className="panel evaluation-summary">
-          {data.price_evaluations.length ? <div className="horizon-stats">{data.price_evaluations.map((evaluation) => <div key={`${evaluation.horizon_minutes}-${evaluation.price_basis ?? ""}`}><small>{formatHorizon(evaluation.horizon_minutes)} · {priceBasisLabel(evaluation.price_basis)}</small><strong>{evaluation.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(evaluation.mean_observed_change_percent)}%`}</strong><span>{evaluation.sample_count} / {evaluation.minimum_sample_count} observations</span></div>)}</div> : <EmptyState title="No completed price evaluations" detail="Subsequent observations will appear here when signal evaluation horizons are reached." compact />}
-          <p>Observed changes are not profitability or directional accuracy. A mean is shown only with at least 10 measured observations for that horizon.</p>
-        </div>
-      </section>
-      <section className="section-block">
-        <SectionHeading title="Market data quality" detail="Trade rules need continuous watermarked scans; older observations do not establish ingestion coverage." />
-        {data.market_quality.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Snapshot freshness</th><th>Last observed</th><th>Trade scan watermark</th><th>Baseline readiness</th></tr></thead><tbody>
-          {data.market_quality.map((market) => <tr key={market.pair}><td>{shortPair(market.pair)}</td><td><Freshness status={market.status} timestamp={market.last_observed_at} /></td><td>{market.last_observed_at ? relativeTime(market.last_observed_at) : "N/A"}</td><td>{market.trade_ingestion_status ?? "unverified"}{market.last_trade_scan_through ? ` · ${relativeTime(market.last_trade_scan_through)}` : ""}</td><td>{Object.entries(market.readiness ?? {}).filter(([name]) => name === "spread_anomaly" || name === "unusual_volume" || name === "large_trade" || name.startsWith("price_")).map(([name, value]) => `${name.replaceAll("_", " ")}: ${value.ready ? "ready" : "insufficient"}`).join(" · ") || "N/A"}</td></tr>)}
-        </tbody></table></div> : <EmptyState title="No monitored markets" detail="Enable a configured watchlist market to inspect data quality." compact />}
-      </section>
-      <section className="section-block">
-        <SectionHeading title="Outcomes by market and signal" detail={`${data.excluded_legacy_signals} legacy signals excluded, including signals generated before depth-unit corrections. Statistics require 10 measured observations.`} />
-        {data.outcomes_by_pair.length ? <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Signal</th><th>Horizon</th><th>Price basis</th><th>Signals</th><th>Measured / missing / pending</th><th>Mean / median change</th><th>Positive / negative</th></tr></thead><tbody>
-          {data.outcomes_by_pair.map((item) => <tr key={`${item.pair}-${item.category}-${item.severity}-${item.horizon_minutes}-${item.price_basis ?? "none"}`}><td>{shortPair(item.pair)}</td><td>{categoryLabel(item.category)} · {item.severity}</td><td>{formatHorizon(item.horizon_minutes)}</td><td>{priceBasisLabel(item.price_basis)}</td><td>{item.signals}</td><td>{item.measured} / {item.missing} / {item.pending}</td><td>{item.mean_observed_change_percent === null ? "Insufficient sample" : `${formatNumber(item.mean_observed_change_percent)}% / ${formatNumber(item.median_observed_change_percent)}%`}</td><td>{item.positive_percent === null ? "N/A" : `${formatNumber(item.positive_percent)}% / ${formatNumber(item.negative_percent)}%`}</td></tr>)}
-        </tbody></table></div> : <EmptyState title="No current-engine signal outcomes" detail="Legacy signals are retained but are not compared with the current engine." compact />}
-      </section>
-      <section className="section-block">
-        <SectionHeading title="Signals by severity" detail="No sample-size adjustment" />
-        <div className="severity-grid">{data.signals_by_severity.length ? data.signals_by_severity.map(({ severity, count }) => <div className="panel severity-count" key={severity}><SeverityBadge value={severity} /><strong>{count}</strong></div>) : <EmptyState title="No signal counts in this period" detail="Signals appear after persisted observations meet configured rules." compact />}</div>
-      </section>
-    </>
-  );
-}
-
 function MarketTable({ markets, onPair }: { markets: Market[]; onPair: (pair: string) => void }) {
   return (
     <div className="panel table-wrap"><table><thead><tr><th>Market</th><th>Tier</th><th>Status</th><th>Last trade price</th><th>24h change</th><th>Observed 24h volume</th><th>Trades</th><th>Best bid / ask</th><th>Spread</th><th>Bid / ask depth</th><th>Last observation</th></tr></thead>
@@ -703,10 +656,6 @@ function Freshness({ status, timestamp }: { status: string; timestamp: string | 
   return <span className={`freshness ${status}`} title={timestamp ? formatDateTime(timestamp) : "No observation recorded"}><span />{label}</span>;
 }
 
-function SeverityBadge({ value }: { value: string }) {
-  return <span className={`severity-badge ${value.toLowerCase()}`}>{value}</span>;
-}
-
 function DetailField({ label, value }: { label: string; value: string }) {
   return <div className="detail-field"><small>{label}</small><strong>{value}</strong></div>;
 }
@@ -808,10 +757,6 @@ function formatHorizon(minutes: number): string {
 
 function formatAxisTime(value: string): string {
   return new Intl.DateTimeFormat(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit", timeZone: "UTC" }).format(new Date(value));
-}
-
-function shortDate(value: string): string {
-  return value.slice(5);
 }
 
 function changeTone(value: string | null): string {

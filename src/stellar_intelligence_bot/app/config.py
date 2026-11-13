@@ -38,6 +38,19 @@ def _watchlist() -> tuple[WatchlistEntry, ...]:
     return entries
 
 
+def _usdc_cross_markets(watchlist: tuple[WatchlistEntry, ...]) -> tuple[WatchlistEntry, ...]:
+    assets = {entry.pair.quote.code: entry for entry in watchlist}
+    usdc = assets["USDC"]
+    return tuple(
+        WatchlistEntry(
+            MarketPair(usdc.pair.quote, assets[code].pair.quote),
+            tier=1,
+            enabled=usdc.enabled and assets[code].enabled,
+        )
+        for code in ("VELO", "SHX", "AQUA")
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class Settings:
     log_level: str = "INFO"
@@ -112,6 +125,7 @@ class Settings:
                 WatchlistEntry(entry.pair, entry.tier, entry.pair.quote.code in names)
                 for entry in watchlist
             )
+        watchlist += _usdc_cross_markets(watchlist)
         legacy_pairs = tuple(
             MarketPair.parse(value.strip())
             for value in os.getenv("BOT_MONITORED_PAIRS", "").split(",")

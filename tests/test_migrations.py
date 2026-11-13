@@ -14,7 +14,7 @@ def test_initial_migration_creates_persistent_schema(tmp_path) -> None:
             for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
         }
 
-    assert version == ("0007_actionable_signals",)
+    assert version == ("0008_evaluation_target_columns",)
     assert {
         "events",
         "signals",

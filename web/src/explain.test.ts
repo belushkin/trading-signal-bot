@@ -15,18 +15,18 @@ describe("explanations", () => {
     expect(() => explainSignal({ ...base, category: "volume_anomaly", observed_facts: undefined })).not.toThrow();
   });
   it("explains missing observations in plain language", () => {
-    expect(missingReasonText("anything_unknown")).toMatch(/insufficient market data/);
+    expect(missingReasonText("anything_unknown")).toMatch(/not have enough market data/);
   });
   it("labels price bases", () => {
     expect(priceBasisText("trade_price")).toMatch(/actual trades/);
-    expect(priceBasisText("snapshot_mid")).toMatch(/order-book/);
+    expect(priceBasisText("snapshot_mid")).toMatch(/buy and sell offers/);
   });
   it("describes mixed bases", () => {
     const out = describeOutcomes([
       { horizon_minutes: 5, status: "measured", price_basis: "snapshot_mid", price_change_percent: 1 },
       { horizon_minutes: 15, status: "measured", price_basis: "trade_price", price_change_percent: -1 },
     ] as any, pairNames("native/VELO"));
-    expect(JSON.stringify(out).toLowerCase()).toMatch(/mix|different|both/);
+    expect(out.note).toMatch(/trade prices; others use buy and sell offers/);
   });
   it("labels severities and ranks by severity", () => {
     expect(severityInfo("HIGH").label).toBe("High");

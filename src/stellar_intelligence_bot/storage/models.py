@@ -230,3 +230,5 @@ class OpportunityEvaluationRecord(Base):
     target_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     status: Mapped[str] = mapped_column(String(32), nullable=False)
     result: Mapped[JsonDocument | None] = mapped_column(json_type)
+    entry_price_observed: Mapped[bool | None] = mapped_column(Boolean)
+    target_price_observed: Mapped[bool | None] = mapped_column(Boolean)

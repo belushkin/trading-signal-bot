@@ -296,6 +296,55 @@ def _record(token: str, **overrides):
     return record
 
 
+@pytest.mark.asyncio
+async def test_collector_scans_issued_asset_pair_with_exact_issuers(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from stellar_intelligence_bot.app.config import Settings
+
+    monkeypatch.delenv("BOT_MONITORED_PAIRS", raising=False)
+    monkeypatch.setenv("BOT_WATCHLIST_ENABLED", "USDC,VELO")
+    pair = next(
+        pair for pair in Settings.from_env().monitored_pairs
+        if pair.base.code == "USDC" and pair.quote.code == "VELO"
+    )
+    client = MagicMock()
+    client.base_url = "https://horizon.stellar.org"
+
+    async def records(path, *, cursor, params):
+        assert path == "trades"
+        assert cursor is None
+        assert params == pair.horizon_params()
+        yield _record(
+            "1-1", base_asset_type="credit_alphanum4",
+            base_asset_code=pair.base.code, base_asset_issuer=pair.base.issuer,
+            counter_asset_type="credit_alphanum4", counter_asset_code=pair.quote.code,
+            counter_asset_issuer=pair.quote.issuer,
+        )
+
+    client.records = records
+    client.order_book = AsyncMock(return_value={
+        "bids": [{"price": "3", "amount": "6"}],
+        "asks": [{"price": "4", "amount": "5"}],
+    })
+    cursors = MagicMock()
+    cursors.get_cursor = AsyncMock(return_value=None)
+    collector = StellarCollector(client, (pair,), cursors)
+    trades = [item async for item in collector._trade_events(pair)]
+    assert len(trades) == 1
+    assert trades[0].stream_key == f"stellar:trades:{pair.key}"
+    assert trades[0].cursor == "1-1"
+    assert trades[0].provenance is not None
+    assert trades[0].provenance.base_asset == pair.base.key
+    assert trades[0].provenance.counter_asset == pair.quote.key
+    snapshot = await collector._market_snapshot(pair)
+    assert snapshot.event is not None
+    assert snapshot.event.attributes["pair"] == pair.key
+    assert snapshot.event.attributes["bid_depth_base"] == Decimal("2")
+    assert pair.base.issuer in snapshot.event.source_ref
+    assert pair.quote.issuer in snapshot.event.source_ref
+
+
 def test_provenance_records_source_facts_and_never_infers_missing_ones() -> None:
     from stellar_intelligence_bot.chains.stellar.collector import parse_trade_provenance
 

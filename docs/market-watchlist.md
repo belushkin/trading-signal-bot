@@ -4,6 +4,9 @@ The packaged watchlist fixes issuer identity; it is not an endorsement of an iss
 redemption, liquidity, or trading strategy. Tier 2 is disabled by default.
 `BOT_WATCHLIST_ENABLED` selects entries by code from these exact identities, not
 arbitrary issuers. A non-empty `BOT_MONITORED_PAIRS` overrides the selection.
+USDC/VELO, USDC/SHX and USDC/AQUA are also monitored when both respective
+assets are enabled, using the same identities below. Their market data has its
+own observation history; the liquidity measurements below concern XLM pairs.
 
 | Pair | Tier | Quote asset code and issuer | Identity source |
 | --- | --- | --- | --- |

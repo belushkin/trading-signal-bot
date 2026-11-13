@@ -129,23 +129,22 @@ describe("dashboard request states", () => {
     const app = render(<App />);
     await screen.findByText("No actionable opportunity currently meets the required criteria.");
     fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
-    const balance = await screen.findByLabelText("Balance: XLM");
+    const balance = await screen.findByLabelText("XLM");
     await vi.waitFor(() => expect(balance).toBeEnabled());
     fireEvent.change(balance, { target: { value: "100" } });
     fireEvent.change(screen.getByLabelText("XLM reserve"), { target: { value: "10" } });
-    fireEvent.change(screen.getByLabelText("Assumed fee per transaction (XLM)"), { target: { value: "0.001" } });
-    fireEvent.change(screen.getByLabelText("Maximum allocation (%)"), { target: { value: "5" } });
+    fireEvent.change(screen.getByLabelText("Maximum position size (%)"), { target: { value: "5" } });
     fireEvent.click(screen.getByRole("button", { name: "Save settings" }));
-    expect(await screen.findByText("Settings saved. New signals will use these settings.")).toBeVisible();
+    expect(await screen.findByText("Portfolio settings saved.")).toBeVisible();
     fireEvent.click(screen.getByRole("button", { name: "Overview" }));
     fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
-    expect(await screen.findByLabelText("Balance: XLM")).toHaveValue("100");
+    await vi.waitFor(() => expect(screen.getByLabelText("XLM")).toHaveValue("100"));
     expect(fetchMock.mock.calls.some((call) => call[1]?.method === "PUT")).toBe(true);
     app.unmount();
     render(<App />);
     await screen.findByText("No actionable opportunity currently meets the required criteria.");
     fireEvent.click(screen.getByRole("button", { name: "Portfolio" }));
-    await vi.waitFor(() => expect(screen.getByLabelText("Balance: XLM")).toHaveValue("100"));
+    await vi.waitFor(() => expect(screen.getByLabelText("XLM")).toHaveValue("100"));
   });
 
   it("shows watchlist tier, disabled state, and missing market metrics", async () => {
@@ -211,7 +210,7 @@ describe("dashboard request states", () => {
         measured_evaluations: 0, missing_evaluations: 0, pending_evaluations: 1,
         missing_observation_rate_percent: null },
       outcomes_by_pair: [{ pair: "native/USDC:issuer", category: "spread_anomaly",
-        severity: "WATCH", horizon_minutes: 5, signals: 1, measured: 0, missing: 0,
+        severity: "WATCH", confidence: "MEDIUM", horizon_minutes: 5, signals: 1, measured: 0, missing: 0,
         pending: 1, mean_observed_change_percent: null, median_observed_change_percent: null,
         positive_percent: null, negative_percent: null }],
     };
@@ -223,12 +222,12 @@ describe("dashboard request states", () => {
     render(<App />);
     expect(await screen.findByText("No actionable opportunity currently meets the required criteria.")).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
-    expect(await screen.findByText(/5 legacy signals excluded/)).toBeInTheDocument();
-    expect(screen.getByText("Insufficient sample")).toBeInTheDocument();
-    expect(screen.getByText("0 / 0 / 1")).toBeInTheDocument();
+    expect(await screen.findByText(/5 older signals are not included/)).toBeInTheDocument();
+    expect(screen.queryByText("Checks waiting")).not.toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "What happened afterward?" })).not.toBeInTheDocument();
   });
 
-  it("keeps snapshot-based and trade-based evaluations in separate analytics rows", async () => {
+  it("keeps target results available on the analytics page", async () => {
     const overview = {
       collector: { status: "healthy", last_success_at: null, last_error_at: null, last_error: null,
         interruption_count: 2, skipped_trade_count: 3, last_skipped_reason: "dust_zero_base_amount" },
@@ -238,7 +237,7 @@ describe("dashboard request states", () => {
       generated_at: "2026-01-01T00:00:00Z",
     };
     const row = (price_basis: string) => ({ pair: "native/USDC:issuer", category: "volume_anomaly",
-      severity: "HIGH", horizon_minutes: 15, price_basis, signals: 1, measured: 1, missing: 0,
+      severity: "HIGH", confidence: "MEDIUM", horizon_minutes: 15, price_basis, signals: 1, measured: 1, missing: 0,
       pending: 0, mean_observed_change_percent: null, median_observed_change_percent: null,
       positive_percent: null, negative_percent: null });
     const analytics = {
@@ -253,15 +252,16 @@ describe("dashboard request states", () => {
     vi.stubGlobal("fetch", vi.fn(async (input: RequestInfo | URL) => ({
       ok: true,
       json: async () => String(input).includes("/api/health") ? { refresh_seconds: 20 }
+        : String(input).includes("/api/assistant/target-results") ? { items: [] }
         : String(input).includes("/api/analytics") ? analytics : overview,
     })));
     render(<App />);
     await openDiagnostics();
     expect(await screen.findByText(/3 skipped trades/)).toBeInTheDocument();
     fireEvent.click(screen.getByRole("button", { name: "Analytics" }));
-    expect(await screen.findByText("Order-book mid")).toBeInTheDocument();
-    expect(screen.getByText("Trade price (fallback)")).toBeInTheDocument();
-    expect(screen.getByText("3 / 4")).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "Was the target price seen?" })).toBeInTheDocument();
+    expect(screen.queryByRole("heading", { name: "What happened afterward?" })).not.toBeInTheDocument();
+    expect(screen.queryByText("Trade provenance")).not.toBeInTheDocument();
   });
 
   it("offers filters for all current market signal categories", async () => {

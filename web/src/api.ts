@@ -33,6 +33,7 @@ export type Signal = {
   expires_at?: string;
   observed_facts?: Record<string, unknown>;
   evaluations?: SignalEvaluation[];
+  trade_totals?: { trade_count: number; base_amount: string; quote_amount: string } | null;
 };
 
 export type SignalEvaluation = {
@@ -157,6 +158,7 @@ export type Analytics = {
     pair: string;
     category: string;
     severity: string;
+    confidence: string;
     horizon_minutes: number;
     price_basis?: string | null;
     signals: number;

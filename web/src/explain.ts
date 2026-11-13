@@ -22,8 +22,8 @@ export const HORIZONS = [5, 15, 60, 240, 1440];
 export const SEVERITY_INFO: Record<string, { label: string; meaning: string; rank: number }> = {
   CRITICAL: { label: "Critical", meaning: "Needs immediate technical attention.", rank: 4 },
   HIGH: { label: "High", meaning: "Unusual market activity worth reviewing.", rank: 3 },
-  WATCH: { label: "Watch", meaning: "A potentially interesting event.", rank: 2 },
-  INFO: { label: "Informational", meaning: "A normal or low-priority observation.", rank: 1 },
+  WATCH: { label: "Watch", meaning: "Something unusual happened.", rank: 2 },
+  INFO: { label: "Info", meaning: "A lower-priority event.", rank: 1 },
 };
 
 export function severityInfo(value: string) {
@@ -42,6 +42,11 @@ export function pairNames(pair: string | null | undefined): PairNames {
   const b = assetName(base);
   const c = assetName(counter);
   return { base: b, counter: c, label: `${b}/${c}` };
+}
+
+export function opportunityLabel(pair: string, side: "BUY" | "SELL"): string {
+  const { base, counter } = pairNames(pair);
+  return `${side} ${base} / ${side === "BUY" ? "SELL" : "BUY"} ${counter}`;
 }
 
 function assetName(key: string): string {
@@ -101,23 +106,23 @@ function venueSentence(tradeType: unknown): string {
 // Direction of a price change, always expressed for the base asset priced in the counter asset.
 export function priceDirectionSentence(pair: PairNames, change: unknown): string {
   const parsed = num(change);
-  if (parsed === null) return "The price change is unknown.";
-  if (parsed === 0) return `The price of ${pair.base} in ${pair.counter} did not change.`;
-  return `${pair.base} became ${parsed > 0 ? "more" : "less"} expensive in ${pair.counter} (${signedPercent(parsed)}).`;
+  if (parsed === null) return "We do not know how the price changed.";
+  if (parsed === 0) return `${pair.base} stayed at the same price in ${pair.counter}.`;
+  if (Math.abs(parsed) < 0.00005) return `${pair.base} went ${parsed > 0 ? "up" : "down"} less than 0.0001% in ${pair.counter}.`;
+  return `${pair.base} ${parsed > 0 ? "went up" : "went down"} ${signedPercent(parsed)} in ${pair.counter}.`;
 }
 
 export const MISSING_REASONS: Record<string, string> = {
   no_snapshot_and_no_trade_in_grace:
-    "No order-book snapshot or trade was recorded close enough to this time.",
+    "No buy and sell offers or trades were recorded close enough to this time.",
   no_reference_trade_in_lookback:
-    "No trade was recorded shortly before the event to compare against.",
-  insufficient_trade_observations: "There were too few trades to measure the change reliably.",
+    "There was no recent trade to compare with.",
+  insufficient_trade_observations: "There were too few trades to check the price change.",
   no_snapshot_in_grace_window_legacy_no_trade_fallback:
-    "No order-book snapshot was recorded close enough to this time (this is an older record, created before trades could be used as a fallback).",
+    "There were no buy and sell offers recorded close enough to this time. This older record could not use trade prices instead.",
 };
 
-const GENERIC_MISSING =
-  "We could not reliably measure the price at this time because there was insufficient market data.";
+const GENERIC_MISSING = "We do not have enough market data to check the price at this time.";
 
 export function missingReasonText(reason: string | null | undefined): string {
   return (reason && MISSING_REASONS[reason]) || GENERIC_MISSING;
@@ -125,13 +130,13 @@ export function missingReasonText(reason: string | null | undefined): string {
 
 export function priceBasisText(basis: string | null | undefined): string {
   if (basis === "trade_price")
-    return "Price change calculated from actual trades. No suitable order-book snapshot was available.";
+    return "Price change based on actual trades. No suitable buy and sell offers were available.";
   if (basis === "snapshot_mid")
-    return "Price change calculated from the order-book mid-price (halfway between the best buy and sell offers).";
-  return "Price source not recorded.";
+    return "Price change based on the middle of the best buy and sell offers.";
+  return "The price source was not recorded.";
 }
 
-function horizonLabel(minutes: number): string {
+export function horizonLabel(minutes: number): string {
   return minutes < 60 ? `${minutes} min` : minutes < 1440 ? `${minutes / 60} h` : `${minutes / 1440} day`;
 }
 
@@ -151,14 +156,13 @@ export function describeOutcomes(
       measuredCount += 1;
       const basis = item.price_basis ?? "snapshot_mid";
       bases.add(basis);
-      const source = basis === "trade_price" ? "from actual trades" : "from order-book mid-price";
       return {
         horizon: label,
-        text: `${priceDirectionSentence(pair, item.observed_change_percent)} (${source})`,
+        text: priceDirectionSentence(pair, item.observed_change_percent),
         measured: true,
       };
     }
-    if (item.status === "pending") return { horizon: label, text: "Not yet due. This will be measured later.", measured: false };
+    if (item.status === "pending") return { horizon: label, text: "Not yet. We will check later.", measured: false };
     missingCount += 1;
     return { horizon: label, text: missingReasonText(item.missing_reason), measured: false };
   });
@@ -170,7 +174,7 @@ export function describeOutcomes(
     if (bases.has(basis)) reliability.push(priceBasisText(basis));
   }
   const note = bases.size > 1
-    ? "Different time horizons use different price sources (order-book mid-price and actual trades), so compare them with care."
+    ? "Some checks use trade prices; others use buy and sell offers. Compare them with care."
     : null;
   return { outcomes, note, reliability };
 }
@@ -225,7 +229,7 @@ const largeTrade: Template = (facts, pair) => {
     ? `A single trade was ${ratio} larger (in ${pair.counter} value) than the typical trade in this market.`
     : facts.baseline_median_quote_notional ? "A single trade was larger than this market's configured large-trade threshold." : baselineMissing("trade sizes");
   const observed = [
-    `The trade moved ${fmt(facts.base_amount_xlm, 0)} ${pair.base}, worth about ${fmt(facts.observed_quote_notional)} ${pair.counter}.`,
+    `${fmt(facts.base_amount_xlm, 0)} ${pair.base} was traded for about ${fmt(facts.observed_quote_notional)} ${pair.counter}.`,
     num(facts.baseline_median_quote_notional) !== null
       ? `The typical trade (median of the previous ${fmt(facts.baseline_trade_count, 0)} trades) was worth ${fmt(facts.baseline_median_quote_notional)} ${pair.counter}.`
       : "No typical trade size is available.",
@@ -233,7 +237,7 @@ const largeTrade: Template = (facts, pair) => {
     venueSentence(facts.trade_type),
   ];
   return {
-    title: `An unusually large ${pair.base} trade in ${pair.label}`,
+    title: `A large ${pair.base} trade in ${pair.label}`,
     why: unusual,
     observed,
     reliability: [`Based on ${fmt(facts.baseline_trade_count, 0)} earlier trades${typeof facts.coverage === "string" ? ` (${facts.coverage})` : ""}.`],
@@ -251,7 +255,9 @@ const volumeAnomaly: Template = (facts, pair, signal) => {
   const period = from && to ? `the five-minute period ${from}–${to}` : "a five-minute period";
   const hasBaseline = num(facts.baseline_mean_base_volume) !== null && Number(facts.baseline_mean_base_volume) > 0;
   const observed = [
-    `${fmt(facts.observed_base_volume, 0)} ${pair.base} traded during ${period}.`,
+    `${fmt(facts.observed_base_volume, 0)} ${pair.base} was exchanged for ${pair.counter}.`,
+    `Each trade had a buyer and a seller. We do not know whether people wanted to buy or sell more ${pair.base}.`,
+    `The trades were recorded during ${period}.`,
     hasBaseline
       ? `The usual amount is ${fmt(facts.baseline_mean_base_volume, 0)} ${pair.base} (average of the previous ${fmt(facts.baseline_windows, 0)} five-minute periods).`
       : "No usual amount is available for comparison.",
@@ -262,7 +268,7 @@ const volumeAnomaly: Template = (facts, pair, signal) => {
   const unknowns = ["Whether the activity was mostly buying or selling pressure, and who was behind it."];
   if (!evidence) unknowns.push("The split between order-book and liquidity-pool trades is shown in the signal details.");
   return {
-    title: `Trading activity spiked in ${pair.label}`,
+    title: `More trading than usual in ${pair.label}`,
     why: hasBaseline && ratio
       ? `Trading activity was ${ratio} higher than usual during ${period}.`
       : baselineMissing("trading activity"),
@@ -312,7 +318,9 @@ const movementTemplate = (kind: "price" | "spread"): Template => (facts, pair) =
     const observed = num(facts.observed_percent);
     const typical = hasBaseline ? `Typical movement over ${window} is about ${fmt(facts.baseline_percent)}%.` : baselineMissing("price movement");
     return {
-      title: `${pair.base} price ${observed !== null && observed < 0 ? "fell" : "rose"} sharply against ${pair.counter}`,
+      title: observed === null
+        ? `${pair.base} price changed in ${pair.counter}`
+        : `${pair.base} price ${observed < 0 ? "went down" : observed > 0 ? "went up" : "did not change"} in ${pair.counter}`,
       why: `The price of ${pair.base} in ${pair.counter} moved more over ${window} than it normally does.`,
       observed: [
         `${priceDirectionSentence(pair, facts.observed_percent)} Measured over ${window}.`,
@@ -330,7 +338,7 @@ const movementTemplate = (kind: "price" | "spread"): Template => (facts, pair) =
       ? "The gap between the best buy and best sell offers (the spread) was wider than usual, which can make trading more costly and prices less certain."
       : baselineMissing("the spread"),
     observed: [
-      `The spread was ${fmt(facts.observed_percent)}% of the price.`,
+      `The gap between buy and sell offers was ${fmt(facts.observed_percent)}% of the price.`,
       hasBaseline ? `It is usually about ${fmt(facts.baseline_percent)}%.` : "No usual spread is available.",
       `The alert threshold was ${fmt(facts.threshold_percent)}%.`,
     ],
@@ -359,7 +367,8 @@ const unusualVolume: Template = (facts, pair) => {
     title: `Trading activity rose in ${pair.label}`,
     why: ratio && !ratio.startsWith("about the same") ? `Trading activity was ${ratio} higher than usual over five minutes.` : baselineMissing("trading activity"),
     observed: [
-      `${fmt(facts.current_five_minute_base_volume, 0)} ${pair.base} traded in five minutes.`,
+      `${fmt(facts.current_five_minute_base_volume, 0)} ${pair.base} was exchanged for ${pair.counter}.`,
+      `Each trade had a buyer and a seller. We do not know whether people wanted to buy or sell more ${pair.base}.`,
       `The usual amount is ${fmt(facts.baseline_mean_base_volume, 0)} ${pair.base} (average of ${fmt(facts.baseline_windows, 0)} earlier periods).`,
     ],
     reliability: ["This is an earlier version of the volume rule; its history is kept as recorded."],
@@ -385,9 +394,9 @@ const TEMPLATES: Record<string, Template> = {
   spread_anomaly: movementTemplate("spread"),
   wide_spread: (facts, pair) => ({
     title: `The buy–sell gap is wide in ${pair.label}`,
-    why: "The gap between the best buy and best sell offers was above a fixed threshold, which can make trading more costly.",
+    why: "The gap between the best buy and sell offers was large. This can make trading more costly.",
     observed: [
-      `The spread was ${fmt(facts.spread_percent)}% of the price.`,
+      `The gap between buy and sell offers was ${fmt(facts.spread_percent)}% of the price.`,
       `The configured threshold was ${fmt(facts.configured_threshold_percent)}%. No historical comparison is available for this older rule.`,
     ],
     reliability: ["Based on a single order-book snapshot."],
@@ -401,12 +410,12 @@ const TEMPLATES: Record<string, Template> = {
 export function categoryTitle(category: string): string {
   const names: Record<string, string> = {
     large_trade: "Large trade",
-    volume_anomaly: "Volume anomaly",
-    price_movement: "Price movement",
-    spread_anomaly: "Spread anomaly",
-    wide_spread: "Wide spread (older rule)",
+    volume_anomaly: "Unusual trading",
+    price_movement: "Price change",
+    spread_anomaly: "Buy and sell price gap",
+    wide_spread: "Wide price gap (older rule)",
     whale_transfer: "Large payment",
-    unusual_volume: "Volume (older rule)",
+    unusual_volume: "Unusual trading (older rule)",
     visible_liquidity: "Large visible order",
   };
   return names[category] ?? category.replaceAll("_", " ");

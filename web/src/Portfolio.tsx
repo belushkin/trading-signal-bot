@@ -2,21 +2,15 @@ import { useEffect, useState } from "react";
 import type { FormEvent } from "react";
 import { get, send } from "./api";
 
-export type Portfolio = {
-  balances: Record<string, string>;
-  reserve: string;
-  fee: string;
-  allocation: string;
-  min_movement_percent: string;
-  minimum_severity: "WATCH" | "HIGH";
+type Portfolio = { balances: Record<string, string>; reserve: string; allocation: string };
+const emptyPortfolio: Portfolio = { balances: {}, reserve: "0", allocation: "10" };
+const assetNames: Record<string, string> = {
+  XLM: "Stellar Lumens", USDC: "USD Coin", SHX: "Stronghold Token",
+  VELO: "Velo", AQUA: "Aquarius",
 };
 
-export const emptyPortfolio: Portfolio = { balances: {}, reserve: "", fee: "", allocation: "", min_movement_percent: "1", minimum_severity: "WATCH" };
-
-function assetLabel(asset: string): string {
-  if (asset === "native") return "XLM";
-  const [code, issuer] = asset.split(":");
-  return issuer ? `${code} (${issuer.slice(0, 5)}…${issuer.slice(-4)})` : asset;
+function symbol(asset: string): string {
+  return asset === "native" ? "XLM" : asset.split(":")[0];
 }
 
 function validAmount(value: string): boolean {
@@ -33,75 +27,114 @@ export function PortfolioSettings({ pairs }: { pairs: string[] }) {
   const [draft, setDraft] = useState<Portfolio>(emptyPortfolio);
   const [message, setMessage] = useState("");
   const [error, setError] = useState("");
+  const [loadError, setLoadError] = useState("");
   const [loading, setLoading] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [valuation, setValuation] = useState<string | null>(null);
+  const [valuationMessage, setValuationMessage] = useState("Enter your balances to see their value.");
+  const [valuationRefresh, setValuationRefresh] = useState(0);
+  const assets = [...new Set(["native", ...pairs.flatMap((pair) => pair.split("/")), ...Object.keys(draft.balances)])];
+
   useEffect(() => {
     const controller = new AbortController();
     get<{ settings: Portfolio | null }>("/api/assistant/settings", controller.signal)
       .then(({ settings }) => { if (settings) setDraft(settings); })
-      .catch((reason: unknown) => { if (!controller.signal.aborted) setError(reason instanceof Error ? reason.message : "Could not load settings"); })
+      .catch((reason: unknown) => { if (!controller.signal.aborted) setLoadError(reason instanceof Error ? reason.message : "Could not load settings"); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
     return () => controller.abort();
   }, []);
-  const assets = [...new Set(["native", ...pairs.flatMap((pair) => pair.split("/"))])];
-  const labelFor = (asset: string) => {
-    const label = assetLabel(asset);
-    return assets.some((other) => other !== asset && assetLabel(other) === label)
-      ? asset : label;
-  };
+  useEffect(() => {
+    const timer = window.setInterval(() => setValuationRefresh((value) => value + 1), 30000);
+    return () => window.clearInterval(timer);
+  }, []);
+
+  const balances = Object.fromEntries(assets.map((asset) => [asset, draft.balances[asset] ?? "0"]));
+  const payload: Portfolio = { balances, reserve: draft.reserve, allocation: draft.allocation };
+  const valid = Object.values(balances).every(validAmount) && validAmount(draft.reserve)
+    && units(draft.reserve) <= units(balances.native)
+    && /^(?:\d{1,3})(?:\.\d{1,4})?$/.test(draft.allocation)
+    && Number(draft.allocation) > 0 && Number(draft.allocation) <= 100;
+  const payloadKey = JSON.stringify(payload);
+  useEffect(() => {
+    let active = true;
+    setValuation(null);
+    if (loading || loadError || !valid) {
+      setValuationMessage("Enter valid balances and reserve to see your portfolio value.");
+      return () => { active = false; };
+    }
+    setValuationMessage("Calculating portfolio value…");
+    const timer = window.setTimeout(() => {
+      send<{ value_xlm: string | null }>("/api/assistant/portfolio-value", "POST", JSON.parse(payloadKey))
+        .then((result) => {
+          if (!active) return;
+          setValuation(result.value_xlm);
+          setValuationMessage(result.value_xlm === null
+            ? "Portfolio value is unavailable because current prices are missing for one or more assets."
+            : "");
+        })
+        .catch(() => { if (active) setValuationMessage("Portfolio value is temporarily unavailable."); });
+    }, 300);
+    return () => { active = false; window.clearTimeout(timer); };
+  }, [payloadKey, valid, loading, loadError, valuationRefresh]);
+
   const change = (next: Portfolio) => { setDraft(next); setMessage(""); setError(""); };
   const save = async (event: FormEvent) => {
     event.preventDefault();
-    const values = [draft.reserve, draft.fee, ...assets.map((asset) => draft.balances[asset] ?? "")];
-    if (values.some((value) => !validAmount(value))) {
-      setError("Enter a non-negative Stellar amount with at most seven decimal places for each field.");
+    if (!Object.values(balances).every(validAmount) || !validAmount(draft.reserve)) {
+      setError("Enter a non-negative amount with at most seven decimal places.");
       return;
     }
-    if (!/^(?:\d{1,3})(?:\.\d{1,4})?$/.test(draft.allocation) || Number(draft.allocation) <= 0 || Number(draft.allocation) > 100) {
-      setError("Maximum allocation must be greater than 0 and no more than 100%.");
+    if (units(draft.reserve) > units(balances.native)) {
+      setError("XLM reserve cannot exceed your XLM balance.");
       return;
     }
-    if (units(draft.reserve) + 2n * units(draft.fee) > units(draft.balances.native)) {
-      setError("XLM must cover the reserve and two assumed transaction fees.");
-      return;
-    }
-    if (!/^(?:\d{1,3})(?:\.\d{1,4})?$/.test(draft.min_movement_percent) || Number(draft.min_movement_percent) <= 0 || Number(draft.min_movement_percent) > 100) {
-      setError("Minimum price movement must be greater than 0 and no more than 100%.");
+    if (!valid) {
+      setError("Maximum position size must be greater than 0 and no more than 100%.");
       return;
     }
     setBusy(true);
     try {
-      await send("/api/assistant/settings", "PUT", draft);
-      setError("");
-      setMessage("Settings saved. New signals will use these settings.");
+      await send("/api/assistant/settings", "PUT", payload);
+      setMessage("Portfolio settings saved.");
     } catch (reason) {
       setError(reason instanceof Error ? reason.message : "Could not save settings");
     } finally { setBusy(false); }
   };
-  return (
-    <>
-      <div className="page-heading"><div><div className="eyebrow">SIGNAL SETTINGS</div><h1>Portfolio settings</h1><p>Enter balances for future signal sizing. No wallet access or private keys are required.</p></div></div>
-      <section className="assistant-section panel">
-        <p>Balances and assumptions are saved in the database. This dashboard has no authentication; use it only on a trusted network.</p>
-        <p>New signals use a preliminary momentum rule, not a validated strategy. Fee assumptions may differ from actual costs.</p>
-        <form className="portfolio-form" onSubmit={save} noValidate>
-          <fieldset disabled={loading || busy}>
-            {assets.map((asset) => <label key={asset}>Balance: {labelFor(asset)}
-              <input aria-label={`Balance: ${labelFor(asset)}`} type="text" inputMode="decimal" value={draft.balances[asset] ?? ""} onChange={(event) => change({ ...draft, balances: { ...draft.balances, [asset]: event.target.value } })} />
-            </label>)}
-            <label>XLM reserve <input type="text" inputMode="decimal" value={draft.reserve} onChange={(event) => change({ ...draft, reserve: event.target.value })} /></label>
-            <label>Assumed fee per transaction (XLM) <input type="text" inputMode="decimal" value={draft.fee} onChange={(event) => change({ ...draft, fee: event.target.value })} /></label>
-            <label>Maximum allocation (%) <input type="text" inputMode="decimal" value={draft.allocation} onChange={(event) => change({ ...draft, allocation: event.target.value })} /></label>
-            <label>Minimum observed price movement (%) <input type="text" inputMode="decimal" value={draft.min_movement_percent} onChange={(event) => change({ ...draft, min_movement_percent: event.target.value })} /></label>
-            <label>Minimum anomaly severity <select value={draft.minimum_severity} onChange={(event) => change({ ...draft, minimum_severity: event.target.value === "WATCH" ? "WATCH" : "HIGH" })}><option value="HIGH">High</option><option value="WATCH">Watch</option></select></label>
-          </fieldset>
-          <p>Reserve and fees are assumptions, not an account check. Allocation limits the available asset, not the value of the whole portfolio.</p>
-          <button className="button button-secondary" type="submit" disabled={loading || busy}>Save settings</button>
-          {error && <p className="notice notice-warning" role="alert">{error}</p>}
-          {message && <p role="status">{message}</p>}
-        </form>
-        <details className="technical-details"><summary>Exact asset identities</summary><ul>{assets.map((asset) => <li key={asset}><code>{asset}</code></li>)}</ul></details>
-      </section>
-    </>
-  );
+  return <>
+    <div className="page-heading"><div><h1>Portfolio settings</h1><p>Enter your balances manually. They are not retrieved from a wallet.</p></div></div>
+    <section className="portfolio-panel panel">
+      <form className="portfolio-form" onSubmit={save} noValidate>
+        <h2>Your balances</h2>
+        <p>Enter 0 for assets you do not hold.</p>
+        <fieldset disabled={loading || busy || !!loadError}>
+          <div className="portfolio-assets">
+            {assets.map((asset) => {
+              const code = symbol(asset);
+              const issuer = asset.split(":")[1];
+              const duplicate = assets.filter((other) => symbol(other) === code).length > 1;
+              const shortIssuer = issuer ? `${issuer.slice(0, 5)}…${issuer.slice(-4)}` : "";
+              const label = duplicate ? `${code} (${issuer})` : code;
+              return <label className="portfolio-asset" key={asset}>
+                <span><strong>{assetNames[code] ?? code}</strong><small>{code}{duplicate && ` · ${shortIssuer}`}</small></span>
+                <input aria-label={label} type="text" inputMode="decimal" value={draft.balances[asset] ?? "0"} onChange={(event) => change({ ...draft, balances: { ...draft.balances, [asset]: event.target.value } })} />
+              </label>;
+            })}
+          </div>
+          <div className="portfolio-limits">
+            <label>XLM reserve <input aria-label="XLM reserve" type="text" inputMode="decimal" value={draft.reserve} onChange={(event) => change({ ...draft, reserve: event.target.value })} /><small>Kept aside and excluded from available value.</small></label>
+            <label>Maximum position size (%) <input aria-label="Maximum position size (%)" type="text" inputMode="decimal" value={draft.allocation} onChange={(event) => change({ ...draft, allocation: event.target.value })} /><small>Percentage of your total available portfolio value.</small></label>
+          </div>
+        </fieldset>
+        <div className="portfolio-value" aria-live="polite">
+          <span>Available portfolio value</span>
+          {valuation !== null ? <strong>{Number(valuation).toLocaleString(undefined, { maximumFractionDigits: 7 })} XLM</strong> : <small>{valuationMessage}</small>}
+          {valuation !== null && <small>Estimated using current market prices, after your XLM reserve.</small>}
+        </div>
+        <p className="portfolio-privacy">Your balances are saved on this server. Use the dashboard only on a trusted network.</p>
+        <button className="button button-secondary" type="submit" disabled={loading || busy || !!loadError}>{busy ? "Saving…" : "Save settings"}</button>
+        {(error || loadError) && <p className="notice notice-warning" role="alert">{error || `Could not load settings: ${loadError}`}</p>}
+        {message && <p role="status">{message}</p>}
+      </form>
+    </section>
+  </>;
 }

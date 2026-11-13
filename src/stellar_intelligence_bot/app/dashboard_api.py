@@ -19,7 +19,11 @@ from sqlalchemy import func, or_, select, text
 from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from stellar_intelligence_bot.app.actionable import AssistantSettings
+from stellar_intelligence_bot.app.actionable import (
+    AssistantSettings,
+    PortfolioSettings,
+    portfolio_value,
+)
 from stellar_intelligence_bot.app.config import Settings
 from stellar_intelligence_bot.app.trade_evidence import account_diagnostics, trade_window_evidence
 from stellar_intelligence_bot.core.market_anomalies import (
@@ -131,25 +135,40 @@ def create_app(
         try:
             async with db.sessions() as session:
                 row = await session.get(AssistantSettingsRecord, 1)
-                return {"settings": row.settings if row else None}
+                if row is None:
+                    return {"settings": None}
+                stored = AssistantSettings.model_validate(row.settings)
+                return {"settings": stored.model_dump(
+                    mode="json", include={"balances", "reserve", "allocation"}
+                )}
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Signal settings are unavailable") from exc
 
     @app.put("/api/assistant/settings")
     async def save_assistant_settings(
-        request: Request, body: AssistantSettings
+        request: Request, body: PortfolioSettings
     ) -> dict[str, object]:
         config: Settings = request.app.state.settings
         assets = {"native"} | {
             asset.key for pair in config.monitored_pairs for asset in (pair.base, pair.quote)
         }
-        if set(body.balances) - assets:
-            raise HTTPException(400, "Balances must refer to configured monitored assets")
         db: Database = request.app.state.database
-        payload = body.model_dump(mode="json")
         try:
             async with db.sessions.begin() as session:
                 row = await session.get(AssistantSettingsRecord, 1)
+                existing = AssistantSettings.model_validate(row.settings) if row else None
+                if existing:
+                    assets.update(existing.balances)
+                if set(body.balances) - assets:
+                    raise HTTPException(400, "Balances must refer to configured monitored assets")
+                if existing:
+                    body.balances = existing.balances | body.balances
+                payload = AssistantSettings(
+                    **body.model_dump(),
+                    **(existing.model_dump(include={
+                        "fee", "min_movement_percent", "minimum_severity"
+                    }) if existing else {}),
+                ).model_dump(mode="json")
                 if row is None:
                     session.add(
                         AssistantSettingsRecord(
@@ -161,7 +180,79 @@ def create_app(
                     row.updated_at = datetime.now(UTC)
         except SQLAlchemyError as exc:
             raise HTTPException(503, "Signal settings could not be saved") from exc
-        return {"settings": payload}
+        return {"settings": body.model_dump(mode="json")}
+
+    @app.post("/api/assistant/portfolio-value")
+    async def assistant_portfolio_value(
+        request: Request, body: PortfolioSettings
+    ) -> dict[str, object]:
+        settings: Settings = request.app.state.settings
+        assets = {"native"} | {
+            asset.key for pair in settings.monitored_pairs for asset in (pair.base, pair.quote)
+        }
+        try:
+            async with request.app.state.database.sessions() as session:
+                row = await session.get(AssistantSettingsRecord, 1)
+                if row is not None:
+                    existing = AssistantSettings.model_validate(row.settings)
+                    assets.update(existing.balances)
+                    body.balances = existing.balances | body.balances
+                if set(body.balances) - assets:
+                    raise HTTPException(400, "Balances must refer to configured monitored assets")
+                total, missing, _ = await portfolio_value(
+                    session, body.balances, body.reserve,
+                    settings.monitored_pairs, datetime.now(UTC),
+                )
+                return {
+                    "value_xlm": str(total) if total is not None else None,
+                    "missing_assets": missing,
+                }
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Portfolio valuation is unavailable") from exc
+
+    @app.get("/api/assistant/target-results")
+    async def assistant_target_results(
+        request: Request,
+        days: Annotated[int, Query(ge=1, le=3650)] = 30,
+    ) -> dict[str, object]:
+        db: Database = request.app.state.database
+        cutoff = datetime.now(UTC) - timedelta(days=days)
+        try:
+            async with db.sessions() as session:
+                rows = (
+                    await session.execute(
+                        select(OpportunityRecord, OpportunityEvaluationRecord)
+                        .join(
+                            OpportunityEvaluationRecord,
+                            OpportunityEvaluationRecord.signal_id == OpportunityRecord.signal_id,
+                        )
+                        .where(OpportunityRecord.created_at >= cutoff)
+                        .order_by(OpportunityRecord.created_at.desc())
+                        .limit(5000)
+                    )
+                ).all()
+        except SQLAlchemyError as exc:
+            raise HTTPException(503, "Target results are unavailable") from exc
+        return {
+            "items": [
+                {
+                    "signal_id": opportunity.signal_id,
+                    "pair": opportunity.pair_key,
+                    "side": opportunity.side,
+                    "created_at": _iso(_as_utc(opportunity.created_at)),
+                    "horizon_minutes": evaluation.horizon_minutes,
+                    "status": evaluation.status,
+                    "entry_price_observed": evaluation.entry_price_observed,
+                    "target_price_observed": evaluation.target_price_observed,
+                    "quote_amount": opportunity.parameters.get("quote_amount"),
+                    "quantity": opportunity.parameters.get("quantity"),
+                    "estimated_profit_quote": opportunity.parameters.get(
+                        "estimated_profit_quote"
+                    ),
+                }
+                for opportunity, evaluation in rows
+            ]
+        }
 
     @app.get("/api/assistant/opportunities")
     async def assistant_opportunities(request: Request) -> dict[str, object]:
@@ -1156,12 +1247,46 @@ async def _summaries_with_outcomes(
         ).all()
         for evaluation in evaluations:
             by_signal[evaluation.signal_id].append(_evaluation(evaluation))
+    volume_totals = {}
+    for row in rows:
+        if row.category != "volume_anomaly":
+            continue
+        facts = row.observed_facts
+        pair = facts.get("pair")
+        try:
+            start = datetime.fromisoformat(str(facts["window_start"]))
+            end = datetime.fromisoformat(str(facts["window_end"]))
+        except (KeyError, ValueError):
+            continue
+        if not isinstance(pair, str) or start.tzinfo is None or end.tzinfo is None or end <= start:
+            continue
+        count, base, quote_amount = (
+            await session.execute(
+                select(
+                    func.count(TradeRecord.trade_id),
+                    func.sum(TradeRecord.base_amount),
+                    func.sum(TradeRecord.quote_amount),
+                ).where(
+                    TradeRecord.pair_key == pair,
+                    TradeRecord.occurred_at >= start,
+                    TradeRecord.occurred_at < end,
+                )
+            )
+        ).one()
+        observed = _decimal_or_none(facts.get("observed_base_volume"))
+        if count and base is not None and quote_amount is not None and observed == base:
+            volume_totals[row.signal_id] = {
+                "trade_count": count,
+                "base_amount": _decimal(base),
+                "quote_amount": _decimal(quote_amount),
+            }
     return [
         {
             **_signal_summary(row),
             "observed_facts": _safe_facts(row.observed_facts),
             "expires_at": _iso(_as_utc(row.expires_at)),
             "evaluations": by_signal[row.signal_id],
+            "trade_totals": volume_totals.get(row.signal_id),
         }
         for row in rows
     ]
